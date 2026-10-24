@@ -1,0 +1,1205 @@
+---
+title: "Time Series Decomposition and Exponential Smoothing"
+author: "Gianmaria Monaco — Bocconi University — Time Series Analysis — Group 32"
+output:
+  pdf_document:
+    number_sections: true
+fontsize: 11pt
+geometry: margin=1in
+documentclass: article
+header-includes:
+  - \usepackage{float}
+  - \usepackage{caption}
+  - \captionsetup[figure]{font=small,labelfont=bf,textfont=it,labelsep=period,justification=raggedright,singlelinecheck=false,skip=6pt}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+fig.width = 6,
+fig.height = 3,
+  fig.align = "center",
+  comment = "##"
+)
+
+options(width = 80)
+set.seed(42)
+
+library(ggplot2)
+library(zoo)
+library(tidyr)
+library(scales)
+```
+
+# Introduction
+
+This report explores trend, seasonality, and exponential smoothing
+through simulated data and four time series available in R:
+AirPassengers, co2, UKgas, and Nile. An additional application examines
+Italian COVID-19 data.
+
+The analysis compares decomposition on original and logarithmic
+scales and illustrates how the smoothing parameter affects simple
+exponential smoothing.
+
+# Creating Time Series Objects
+
+We simulate 24 independent observations from a normal distribution
+with mean zero and variance two, then round them to two decimal places.
+We use the same observations to create two time series objects with
+different frequencies.
+
+```{r time-series-objects}
+x <- round(rnorm(24, mean = 0, sd = sqrt(2)), 2)
+
+y <- ts(x)
+z <- ts(x, frequency = 12)
+
+y
+z
+```
+
+Both objects contain the same values. The object `y` has frequency 1,
+while `z` has frequency 12, representing 12 observations per time unit.
+Interpreting the time unit as a year gives two years of monthly
+observations. Setting the frequency defines the time index; it does
+not introduce seasonality into the simulated data.
+
+# Visualizing a Simulated Random Walk
+
+We construct a random walk by taking the cumulative sum of 24
+independent standard normal increments. Monthly dates provide
+a calendar index for the plot.
+
+```{r simulate-random-walk}
+mydata <- data.frame(
+  time = seq.Date(
+    from = as.Date("2020-01-01"),
+    by = "month",
+    length.out = 24
+  ),
+  value = cumsum(rnorm(24))
+)
+```
+
+```{r random-walk-plot, echo=FALSE}
+ggplot(mydata, aes(x = time, y = value)) +
+  geom_line(color = "#24476B", linewidth = 0.6) +
+  scale_x_date(
+    date_breaks = "6 months",
+    date_labels = "%b %Y",
+    expand = expansion(mult = c(0.02, 0.06))
+  ) +
+  labs(
+    title = "Simulated Random Walk",
+    x = "Date",
+    y = "Value"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title = element_text(hjust = 0),
+    panel.grid.minor = element_blank()
+  )
+```
+
+Although the increments have mean zero, their cumulative sum can
+display persistent upward or downward movements. Such movements
+do not imply that a deterministic trend was imposed.
+
+# Seasonal Decomposition Methods
+
+An additive decomposition represents a time series as
+
+$$
+Y_t = T_t + S_t + R_t,
+$$
+
+where $T_t$ is the trend, $S_t$ is the seasonal component, and $R_t$
+is the remainder. A multiplicative decomposition instead uses
+
+$$
+Y_t = T_t S_t R_t.
+$$
+
+For positive observations, taking logarithms converts a multiplicative
+structure into an additive one.
+
+The function `decompose()` estimates the trend using moving averages
+and a seasonal pattern that repeats across cycles. The function
+`stl()` uses LOESS smoothing to separate trend, seasonality,
+and remainder.
+
+STL can accommodate changing seasonality and optionally use robust
+fitting. In the application below, however, `s.window = "periodic"`
+imposes a fixed seasonal pattern on the log scale, and robust fitting
+is not enabled.
+
+# AirPassengers: Comparing Decomposition Methods
+
+We analyze monthly international airline passenger totals from
+1949 to 1960 using the built-in `AirPassengers` dataset.
+
+```{r prepare-airpassengers}
+ap_data <- data.frame(
+  time = as.Date(as.yearmon(time(AirPassengers))),
+  value = as.numeric(AirPassengers)
+)
+```
+
+```{r airpassengers-plot, echo=FALSE}
+ggplot(ap_data, aes(x = time, y = value)) +
+  geom_line(color = "#24476B", linewidth = 0.6) +
+  labs(
+    title = "Monthly Airline Passenger Totals",
+    x = "Year",
+    y = "Passengers (thousands)"
+  ) +
+  scale_x_date(
+    date_breaks = "2 years",
+    date_labels = "%Y"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title = element_text(hjust = 0),
+    panel.grid.minor = element_blank()
+  )
+```
+
+The series displays an upward trend and seasonal fluctuations whose
+amplitude increases with the level. This suggests a multiplicative
+structure. A logarithmic transformation reduces these differences
+in seasonal amplitude and makes an additive decomposition on the
+transformed scale a reasonable alternative.
+
+We compare classical multiplicative decomposition, classical additive
+decomposition of log passenger totals, and STL decomposition of log
+passenger totals with periodic seasonality.
+
+```{r fit-airpassengers-decompositions}
+dec_mult <- decompose(
+  AirPassengers,
+  type = "multiplicative"
+)
+
+dec_add <- decompose(
+  log(AirPassengers),
+  type = "additive"
+)
+
+stl_fit <- stl(
+  log(AirPassengers),
+  s.window = "periodic"
+)
+```
+
+```{r prepare-decomposition-plots, echo=FALSE}
+mult_long <- pivot_longer(
+  data.frame(
+    time = ap_data$time,
+    observed = as.numeric(dec_mult$x),
+    trend = as.numeric(dec_mult$trend),
+    seasonal = as.numeric(dec_mult$seasonal),
+    remainder = as.numeric(dec_mult$random)
+  ),
+  cols = -time,
+  names_to = "component",
+  values_to = "value"
+)
+
+add_long <- pivot_longer(
+  data.frame(
+    time = ap_data$time,
+    observed = as.numeric(dec_add$x),
+    trend = as.numeric(dec_add$trend),
+    seasonal = as.numeric(dec_add$seasonal),
+    remainder = as.numeric(dec_add$random)
+  ),
+  cols = -time,
+  names_to = "component",
+  values_to = "value"
+)
+
+stl_long <- pivot_longer(
+  data.frame(
+    time = ap_data$time,
+    observed = as.numeric(log(AirPassengers)),
+    trend = as.numeric(stl_fit$time.series[, "trend"]),
+    seasonal = as.numeric(stl_fit$time.series[, "seasonal"]),
+    remainder = as.numeric(stl_fit$time.series[, "remainder"])
+  ),
+  cols = -time,
+  names_to = "component",
+  values_to = "value"
+)
+
+component_order <- c(
+  "observed", "trend", "seasonal", "remainder"
+)
+
+component_labels <- c(
+  "Observed", "Trend", "Seasonal", "Remainder"
+)
+
+mult_long$component <- factor(
+  mult_long$component,
+  levels = component_order,
+  labels = component_labels
+)
+
+add_long$component <- factor(
+  add_long$component,
+  levels = component_order,
+  labels = component_labels
+)
+
+stl_long$component <- factor(
+  stl_long$component,
+  levels = component_order,
+  labels = component_labels
+)
+```
+
+```{r airpassengers-comparison, echo=FALSE, fig.width=6.4, fig.height=4.4, out.width="100%", fig.cap="AirPassengers decomposition. Columns show classical multiplicative decomposition (A), classical additive decomposition on the log scale (B), and periodic STL on the log scale (C). Vertical scales vary across panels; multiplicative components and log-scale components have different units.", fig.pos="!htbp"}
+decomposition_plot <- function(data, title) {
+  ggplot(data, aes(x = time, y = value)) +
+    geom_line(
+      color = "#243746",
+      linewidth = 0.35,
+      na.rm = TRUE
+    ) +
+    facet_wrap(
+      ~component,
+      ncol = 1,
+      scales = "free_y"
+    ) +
+    scale_x_date(
+      breaks = as.Date(c("1950-01-01", "1955-01-01", "1960-01-01")),
+      date_labels = "%Y"
+    ) +
+    scale_y_continuous(
+      breaks = scales::breaks_pretty(n = 3)
+    ) +
+    labs(
+      title = title,
+      x = NULL,
+      y = NULL
+    ) +
+    theme_bw(base_size = 8) +
+    theme(
+      plot.title = element_text(
+        size = 9,
+        face = "bold",
+        hjust = 0,
+        margin = margin(b = 6)
+      ),
+      strip.background = element_rect(
+        fill = "#F2F2F2",
+        color = NA
+      ),
+      strip.text = element_text(size = 8),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      panel.grid.major.y = element_line(
+        color = "#E8E8E8",
+        linewidth = 0.2
+      ),
+      panel.border = element_rect(
+        color = "#888888",
+        linewidth = 0.3
+      ),
+      panel.spacing = grid::unit(0.6, "lines"),
+      axis.text = element_text(color = "#333333", size = 7),
+      axis.ticks = element_line(linewidth = 0.3),
+      plot.margin = margin(4, 6, 4, 4)
+    )
+}
+
+plots <- list(
+  decomposition_plot(mult_long, "A  Multiplicative"),
+  decomposition_plot(add_long, "B  Additive (log)"),
+  decomposition_plot(stl_long, "C  STL (log)")
+)
+
+# Align panel widths and heights across the three columns.
+grobs <- lapply(plots, ggplotGrob)
+
+shared_widths <- do.call(
+  grid::unit.pmax,
+  lapply(grobs, function(g) g$widths)
+)
+
+shared_heights <- do.call(
+  grid::unit.pmax,
+  lapply(grobs, function(g) g$heights)
+)
+
+grid::grid.newpage()
+grid::pushViewport(
+  grid::viewport(layout = grid::grid.layout(1, 3))
+)
+
+for (i in seq_along(grobs)) {
+  grobs[[i]]$widths <- shared_widths
+  grobs[[i]]$heights <- shared_heights
+
+  grid::pushViewport(
+    grid::viewport(layout.pos.row = 1, layout.pos.col = i)
+  )
+  grid::grid.draw(grobs[[i]])
+  grid::popViewport()
+}
+
+grid::popViewport()
+```
+
+All three specifications impose a repeating seasonal pattern on their
+respective scales. The two log-scale decompositions differ in how
+they estimate the trend and seasonal components, rather than in
+whether seasonality is allowed to evolve.
+
+Classical decomposition leaves missing trend and remainder values at
+the series endpoints because of its centered moving average.
+STL provides estimates across the full observed period.
+
+The multiplicative remainder is expressed as a ratio around one,
+whereas the log-scale remainders are additive deviations around zero.
+Their magnitudes should therefore not be compared directly.
+
+# Atmospheric CO2: Trend and Seasonal Decomposition
+
+We analyze monthly atmospheric carbon dioxide concentrations at
+Mauna Loa from 1959 to 1997, using the built-in `co2` dataset.
+Concentrations are expressed in parts per million (ppm).
+
+We use classical additive decomposition to separate the long-term
+trend, a repeating annual seasonal pattern, and the remainder:
+
+$$
+Y_t = T_t + S_t + R_t.
+$$
+
+This specification assumes that seasonal effects have a constant
+absolute amplitude over time.
+
+```{r co2-decomposition}
+dec_co2 <- decompose(co2, type = "additive")
+
+detrended <- co2 - dec_co2$trend
+Yt_star <- detrended - dec_co2$seasonal
+co2_remainder <- dec_co2$random
+```
+
+Subtracting the estimated trend leaves seasonal fluctuations and the
+remainder. Subtracting the seasonal component as well gives
+
+$$
+Y_t^* = Y_t - \widehat{T}_t - \widehat{S}_t.
+$$
+
+The first figure displays the observed series and its estimated
+components. Each panel has its own vertical scale.
+
+```{r co2-components-data, include=FALSE}
+co2_dates <- as.Date(as.yearmon(time(co2)))
+
+co2_long <- pivot_longer(
+  data.frame(
+    time = co2_dates,
+    observed = as.numeric(co2),
+    trend = as.numeric(dec_co2$trend),
+    seasonal = as.numeric(dec_co2$seasonal),
+    remainder = as.numeric(co2_remainder)
+  ),
+  cols = -time,
+  names_to = "component",
+  values_to = "value"
+)
+
+co2_long$component <- factor(
+  co2_long$component,
+  levels = c("observed", "trend", "seasonal", "remainder"),
+  labels = c(
+    "A  Observed",
+    "B  Trend",
+    "C  Seasonal",
+    "D  Remainder"
+  )
+)
+```
+
+```{r co2-components-plot, echo=FALSE, fig.width=5, fig.height=2.3, out.width="90%", fig.pos="H", fig.cap="Classical additive decomposition of monthly Mauna Loa CO2 concentrations. All panels are expressed in ppm, with separate vertical scales. The seasonal pattern repeats by construction; centered moving averages leave trend and remainder values unavailable at the endpoints."}
+ggplot(co2_long, aes(x = time, y = value)) +
+  geom_line(
+    color = "#243746",
+    linewidth = 0.35,
+    na.rm = TRUE
+  ) +
+  facet_wrap(~component, ncol = 2, scales = "free_y") +
+  scale_x_date(
+  breaks = as.Date(c(
+    "1960-01-01", "1970-01-01",
+    "1980-01-01", "1990-01-01"
+  )),
+  date_labels = "%Y"
+) +
+  scale_y_continuous(
+    breaks = scales::breaks_pretty(n = 3)
+  ) +
+  labs(x = "Year", y = "CO2 (ppm)") +
+  theme_bw(base_size = 9) +
+  theme(
+    strip.background = element_rect(
+      fill = "#F2F2F2",
+      color = NA
+    ),
+    strip.text = element_text(size = 9, hjust = 0),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "#E8E8E8",
+      linewidth = 0.2
+    ),
+    panel.border = element_rect(
+      color = "#888888",
+      linewidth = 0.3
+    ),
+    axis.text = element_text(color = "#333333"),
+    panel.spacing = grid::unit(0.8, "lines")
+  )
+```
+
+The estimated trend increases over the observation period.
+The seasonal component captures a recurring annual cycle.
+Its constant amplitude is imposed by classical decomposition,
+rather than independently established by the seasonal panel.
+
+We next compare the original series with the results of removing
+the trend and seasonality. In the final panel, we overlay the
+decomposition remainder and the manually calculated $Y_t^*$.
+
+```{r co2-transformations-data, include=FALSE}
+co2_transformations <- data.frame(
+  time = rep(co2_dates, 5),
+  panel = rep(
+    c(
+      "A  Original",
+      "B  Detrended",
+      "C  Detrended and deseasonalized",
+      "D  Remainder comparison",
+      "D  Remainder comparison"
+    ),
+    each = length(co2)
+  ),
+  value = c(
+    as.numeric(co2),
+    as.numeric(detrended),
+    as.numeric(Yt_star),
+    as.numeric(co2_remainder),
+    as.numeric(Yt_star)
+  ),
+  series = rep(
+    c(
+      "Series",
+      "Series",
+      "Series",
+      "Decomposition remainder",
+      "Manual remainder"
+    ),
+    each = length(co2)
+  )
+)
+
+co2_transformations$panel <- factor(
+  co2_transformations$panel,
+  levels = c(
+    "A  Original",
+    "B  Detrended",
+    "C  Detrended and deseasonalized",
+    "D  Remainder comparison"
+  )
+)
+```
+
+```{r co2-transformations-plot, echo=FALSE, fig.width=6, fig.height=3, out.width="90%", fig.pos="H", fig.cap="Removing trend and seasonality from the CO2 series. Panel D overlays the decomposition remainder and the manually calculated remainder, which coincide by definition wherever the trend estimate is available. Vertical scales differ across panels."}
+ggplot(
+  co2_transformations,
+  aes(x = time, y = value, linetype = series)
+) +
+  geom_line(
+    color = "#243746",
+    linewidth = 0.35,
+    na.rm = TRUE
+  ) +
+  facet_wrap(~panel, ncol = 2, scales = "free_y") +
+  scale_linetype_manual(
+    values = c(
+      "Series" = "solid",
+      "Decomposition remainder" = "solid",
+      "Manual remainder" = "dashed"
+    ),
+    breaks = c(
+      "Decomposition remainder",
+      "Manual remainder"
+    ),
+    name = NULL
+  ) +
+  scale_x_date(
+  breaks = as.Date(c(
+    "1960-01-01", "1970-01-01",
+    "1980-01-01", "1990-01-01"
+  )),
+  date_labels = "%Y"
+) +
+  scale_y_continuous(
+    breaks = scales::breaks_pretty(n = 3)
+  ) +
+  labs(x = "Year", y = "CO2 (ppm)") +
+  theme_bw(base_size = 9) +
+  theme(
+    strip.background = element_rect(
+      fill = "#F2F2F2",
+      color = NA
+    ),
+    strip.text = element_text(size = 9, hjust = 0),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "#E8E8E8",
+      linewidth = 0.2
+    ),
+    panel.border = element_rect(
+      color = "#888888",
+      linewidth = 0.3
+    ),
+    axis.text = element_text(color = "#333333"),
+    panel.spacing = grid::unit(0.8, "lines"),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8)
+  )
+```
+
+The detrended series retains the annual seasonal cycle. Removing
+the estimated seasonal component leaves fluctuations around zero.
+
+The manually calculated series $Y_t^*$ and the decomposition
+remainder coincide by construction. Their agreement checks the
+calculation, but does not establish that the remainder is white
+noise or that the decomposition fully captures the underlying
+dynamics.
+
+# UK Gas Consumption: Original and Logarithmic Scales
+
+We analyze quarterly UK gas consumption from 1960 to 1986 using
+the built-in `UKgas` dataset. Seasonal fluctuations become larger
+as the level of the series increases, suggesting that a logarithmic
+transformation may be useful.
+
+We compare classical additive decomposition of the original series
+with classical additive decomposition of its logarithm.
+
+```{r ukgas-decomposition}
+dec_add_uk <- decompose(UKgas, type = "additive")
+dec_log_uk <- decompose(log(UKgas), type = "additive")
+```
+
+Both specifications impose a repeating seasonal pattern. On the
+original scale, seasonal effects are measured in absolute units.
+On the logarithmic scale, additive seasonal effects correspond
+to multiplicative factors on the original scale.
+
+```{r ukgas-components, include=FALSE}
+ukgas_dates <- as.Date(as.yearqtr(time(UKgas)))
+
+ukgas_components <- function(fit) {
+  result <- pivot_longer(
+    data.frame(
+      time = ukgas_dates,
+      observed = as.numeric(fit$x),
+      trend = as.numeric(fit$trend),
+      seasonal = as.numeric(fit$seasonal),
+      remainder = as.numeric(fit$random)
+    ),
+    cols = -time,
+    names_to = "component",
+    values_to = "value"
+  )
+
+  result$component <- factor(
+    result$component,
+    levels = c("observed", "trend", "seasonal", "remainder"),
+    labels = c("Observed", "Trend", "Seasonal", "Remainder")
+  )
+
+  result
+}
+
+ukgas_original <- ukgas_components(dec_add_uk)
+ukgas_log <- ukgas_components(dec_log_uk)
+```
+
+```{r ukgas-comparison, echo=FALSE, fig.width=6.4, fig.height=4.4, out.width="95%", fig.pos="H", fig.cap="Classical additive decomposition of UK gas consumption on the original scale (A) and logarithmic scale (B). Vertical scales vary across panels. Components on the two scales have different units."}
+ukgas_plot <- function(data, title) {
+  ggplot(data, aes(x = time, y = value)) +
+    geom_line(
+      color = "#243746",
+      linewidth = 0.35,
+      na.rm = TRUE
+    ) +
+    facet_wrap(
+      ~component,
+      ncol = 1,
+      scales = "free_y"
+    ) +
+    scale_x_date(
+  breaks = as.Date(c(
+    "1960-01-01", "1970-01-01", "1980-01-01"
+  )),
+  date_labels = "%Y"
+) +
+    scale_y_continuous(
+      breaks = scales::breaks_pretty(n = 3)
+    ) +
+    labs(title = title, x = NULL, y = NULL) +
+    theme_bw(base_size = 8) +
+    theme(
+      plot.title = element_text(
+        size = 9,
+        face = "bold",
+        hjust = 0,
+        margin = margin(b = 6)
+      ),
+      strip.background = element_rect(
+        fill = "#F2F2F2",
+        color = NA
+      ),
+      strip.text = element_text(size = 8),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.y = element_line(
+        color = "#E8E8E8",
+        linewidth = 0.2
+      ),
+      panel.border = element_rect(
+        color = "#888888",
+        linewidth = 0.3
+      ),
+      panel.spacing = grid::unit(0.6, "lines"),
+      axis.text = element_text(
+        size = 7,
+        color = "#333333"
+      ),
+      axis.ticks = element_line(linewidth = 0.3),
+      plot.margin = margin(4, 6, 4, 4)
+    )
+}
+
+ukgas_plots <- list(
+  ukgas_plot(ukgas_original, "A  Original scale"),
+  ukgas_plot(ukgas_log, "B  Logarithmic scale")
+)
+
+ukgas_grobs <- lapply(ukgas_plots, ggplotGrob)
+
+shared_widths <- do.call(
+  grid::unit.pmax,
+  lapply(ukgas_grobs, function(g) g$widths)
+)
+
+shared_heights <- do.call(
+  grid::unit.pmax,
+  lapply(ukgas_grobs, function(g) g$heights)
+)
+
+grid::grid.newpage()
+grid::pushViewport(
+  grid::viewport(layout = grid::grid.layout(1, 2))
+)
+
+for (i in seq_along(ukgas_grobs)) {
+  ukgas_grobs[[i]]$widths <- shared_widths
+  ukgas_grobs[[i]]$heights <- shared_heights
+
+  grid::pushViewport(
+    grid::viewport(layout.pos.row = 1, layout.pos.col = i)
+  )
+  grid::grid.draw(ukgas_grobs[[i]])
+  grid::popViewport()
+}
+
+grid::popViewport()
+```
+
+On the original scale, the remainder displays larger fluctuations
+toward the end of the sample. Taking logarithms reduces the contrast
+between early and late fluctuations, although visible structure
+remains in the remainder.
+
+The repeating seasonal components are imposed by the decomposition
+method. Their appearance does not establish that seasonality is
+constant in the observed data. The logarithmic transformation
+addresses changes in scale, but does not allow the estimated seasonal
+pattern to evolve over time.
+
+This comparison illustrates how the transformation affects the
+decomposition. It does not, by itself, establish that either
+specification produces an adequate remainder or better forecasts.
+
+# Nile River Flow: Simple Exponential Smoothing
+
+We analyze annual Nile river flow at Aswan from 1871 to 1970 using
+the built-in `Nile` dataset. Flow is expressed in units of
+$10^8$ cubic metres. We compare simple exponential smoothing
+with an estimated smoothing parameter and two fixed values:
+$\alpha = 0.1$ and $\alpha = 0.9$.
+
+The level is updated according to
+
+$$
+\ell_t = \alpha Y_t + (1-\alpha)\ell_{t-1},
+$$
+
+and the one-step-ahead fitted value is $\hat{Y}_{t|t-1} = \ell_{t-1}$.
+A larger $\alpha$ gives more weight to the latest observation.
+Trend and seasonal components are excluded.
+
+```{r nile-models}
+hw_default <- HoltWinters(Nile, beta = FALSE, gamma = FALSE)
+hw_01 <- HoltWinters(Nile, alpha = 0.1, beta = FALSE, gamma = FALSE)
+hw_09 <- HoltWinters(Nile, alpha = 0.9, beta = FALSE, gamma = FALSE)
+```
+
+The first specification estimates $\alpha$ by minimizing the sum
+of squared one-step-ahead errors. The other two hold $\alpha$ fixed
+to illustrate how responsiveness changes.
+
+```{r nile-plot-data, include=FALSE}
+nile_models <- list(
+  hw_default,
+  hw_01,
+  hw_09
+)
+
+nile_labels <- c(
+  sprintf("A  Estimated alpha = %.3f", hw_default$alpha),
+  "B  Fixed alpha = 0.1",
+  "C  Fixed alpha = 0.9"
+)
+
+nile_plot_data <- do.call(
+  rbind,
+  lapply(seq_along(nile_models), function(i) {
+    fit <- nile_models[[i]]
+
+    rbind(
+      data.frame(
+        year = as.numeric(time(Nile)),
+        value = as.numeric(Nile),
+        series = "Observed",
+        model = nile_labels[i]
+      ),
+      data.frame(
+        year = as.numeric(time(fit$fitted)),
+        value = as.numeric(fit$fitted[, "xhat"]),
+        series = "One-step fitted",
+        model = nile_labels[i]
+      )
+    )
+  })
+)
+
+nile_plot_data$model <- factor(
+  nile_plot_data$model,
+  levels = nile_labels
+)
+```
+
+```{r nile-comparison, echo=FALSE, fig.width=6.4, fig.height=4.6, out.width="95%", fig.pos="H", fig.cap="Observed annual Nile river flow and one-step-ahead fitted values from simple exponential smoothing. All panels use the same axes. The smoothing parameter controls how quickly predictions respond to recent observations."}
+ggplot(
+  nile_plot_data,
+  aes(
+    x = year,
+    y = value,
+    color = series,
+    linetype = series
+  )
+) +
+  geom_line(linewidth = 0.4) +
+  facet_wrap(~model, ncol = 1) +
+  scale_color_manual(
+    values = c(
+      "Observed" = "#333333",
+      "One-step fitted" = "#B36B35"
+    ),
+    breaks = c("Observed", "One-step fitted")
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "Observed" = "solid",
+      "One-step fitted" = "dashed"
+    ),
+    breaks = c("Observed", "One-step fitted")
+  ) +
+  scale_x_continuous(
+    breaks = seq(1880, 1960, by = 20)
+  ) +
+  labs(
+    x = "Year",
+    y = expression("Annual flow (" * 10^8 * " m"^3 * ")"),
+    color = NULL,
+    linetype = NULL
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    strip.background = element_rect(
+      fill = "#F2F2F2",
+      color = NA
+    ),
+    strip.text = element_text(size = 9, hjust = 0),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "#E8E8E8",
+      linewidth = 0.2
+    ),
+    panel.border = element_rect(
+      color = "#888888",
+      linewidth = 0.3
+    ),
+    panel.spacing = grid::unit(0.7, "lines"),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8)
+  )
+```
+
+With $\alpha = 0.1$, fitted values change gradually and respond slowly
+to shifts in the series. With $\alpha = 0.9$, they respond more rapidly
+to recent observations, but also reflect more of the year-to-year
+variation. The estimated parameter gives an intermediate response.
+
+We summarize the one-step-ahead fitting errors using mean absolute
+percentage error:
+
+$$
+\operatorname{MAPE}
+=
+\frac{100}{n}
+\sum_{t}
+\left|
+\frac{Y_t-\hat{Y}_{t|t-1}}{Y_t}
+\right|,
+$$
+
+Here, n = 99 is the number of observations with available fitted
+values, covering 1872–1970. The first observation, in 1871, initializes
+the level and has no corresponding one-step-ahead fitted value.
+
+```{r nile-mape}
+nile_mape <- function(fit) {
+  fitted_values <- fit$fitted[, "xhat"]
+
+  observed_values <- window(
+    Nile,
+    start = start(fitted_values),
+    end = end(fitted_values)
+  )
+
+  100 * mean(
+    abs(
+      (as.numeric(observed_values) - as.numeric(fitted_values)) /
+        as.numeric(observed_values)
+    )
+  )
+}
+
+nile_results <- data.frame(
+  Specification = c(
+    "Estimated alpha",
+    "Fixed alpha = 0.1",
+    "Fixed alpha = 0.9"
+  ),
+  Alpha = c(hw_default$alpha, hw_01$alpha, hw_09$alpha),
+  MAPE = vapply(nile_models, nile_mape, numeric(1))
+)
+
+knitr::kable(
+  nile_results,
+  digits = c(NA, 3, 2),
+  col.names = c("Specification", "Alpha", "MAPE (%)"),
+  row.names = FALSE,
+  align = c("l", "r", "r")
+)
+```
+
+The estimated-alpha specification has the lowest MAPE among the
+three fits (13.07%), followed by alpha = 0.1 (13.48%) and
+alpha = 0.9 (14.50%). MAPE does not change monotonically across
+these three alpha values. The estimated alpha minimizes the sum
+of squared fitting errors, rather than MAPE.
+
+These are in-sample fitting errors. No observations are held out,
+so the comparison does not establish which specification would
+forecast future river flow most accurately.
+
+# Italian COVID-19 Data: Daily Patterns and Smoothing
+
+We examine cumulative reported cases, cumulative deaths, intensive
+care occupancy, and daily new reported cases in Italy. We then apply
+simple exponential smoothing to the daily case series.
+
+The data file is stored in the repository. Dates are reconstructed
+from Italian day-month labels, starting in 2020 and advancing the
+year when the month sequence resets.
+
+```{r covid-data, include=FALSE}
+data_url <- paste0(
+  "https://raw.githubusercontent.com/",
+  "MnGianmaria/time-series-analysis/main/",
+  "01_decomposition_and_smoothing/data/",
+  "coronavirus-data.txt"
+)
+
+covid <- read.table(
+  data_url,
+  header = TRUE,
+  sep = "",
+  fill = TRUE,
+  stringsAsFactors = FALSE
+)
+
+date_parts <- strsplit(
+  tolower(trimws(covid$day)),
+  "[-/[:space:]]+"
+)
+
+day_number <- as.integer(vapply(
+  date_parts, function(x) x[1], character(1)
+))
+
+month_label <- vapply(
+  date_parts, function(x) x[2], character(1)
+)
+
+month_number <- match(
+  substr(month_label, 1, 3),
+  c("gen", "feb", "mar", "apr", "mag", "giu",
+    "lug", "ago", "set", "ott", "nov", "dic")
+)
+
+stopifnot(
+  !anyNA(day_number),
+  !anyNA(month_number)
+)
+
+year_number <- 2020L + cumsum(
+  c(FALSE, diff(month_number) < 0)
+)
+
+covid$date <- as.Date(sprintf(
+  "%04d-%02d-%02d",
+  year_number, month_number, day_number
+))
+
+stopifnot(
+  !anyNA(covid$date),
+  !anyDuplicated(covid$date),
+  all(diff(covid$date) == 1)
+)
+
+covid$day <- NULL
+
+names(covid)[names(covid) == "intesiveCare"] <- "intensiveCare"
+
+stopifnot(
+  all(is.finite(covid$contagion)),
+  all(covid$contagion > 0)
+)
+
+nuovi_casi <- diff(covid$contagion)
+```
+
+The observations cover `r format(min(covid$date), "%Y-%m-%d")`
+to `r format(max(covid$date), "%Y-%m-%d")`.
+We display cumulative cases on both their original and natural
+logarithmic scales. Changes in log cumulative cases describe
+relative growth in the cumulative total, rather than growth
+in daily new cases.
+
+```{r covid-overview-data, include=FALSE}
+covid_overview <- data.frame(
+  date = rep(covid$date, 4),
+  panel = rep(
+    c(
+      "A  Cumulative reported cases",
+      "B  Log cumulative reported cases",
+      "C  Cumulative deaths",
+      "D  Intensive care occupancy"
+    ),
+    each = nrow(covid)
+  ),
+  value = c(
+    covid$contagion,
+    log(covid$contagion),
+    covid$deaths,
+    covid$intensiveCare
+  )
+)
+
+covid_overview$panel <- factor(
+  covid_overview$panel,
+  levels = unique(covid_overview$panel)
+)
+```
+
+```{r covid-overview-plot, echo=FALSE, fig.width=6.4, fig.height=2.5, out.width="95%", fig.pos="H", fig.cap="Italian COVID-19 indicators. Panels show cumulative reported cases, their natural logarithm, cumulative deaths, and intensive care occupancy. Vertical scales and units differ across panels."}
+ggplot(covid_overview, aes(x = date, y = value)) +
+  geom_line(color = "#243746", linewidth = 0.4) +
+  facet_wrap(~panel, ncol = 2, scales = "free_y") +
+  scale_x_date(
+    breaks = as.Date(c(
+      "2020-04-01", "2020-07-01",
+      "2020-10-01", "2021-01-01"
+    )),
+    labels = c("Apr 2020", "Jul 2020", "Oct 2020", "Jan 2021")
+  ) +
+  scale_y_continuous(
+    labels = scales::label_number(big.mark = ","),
+    breaks = scales::breaks_pretty(n = 3)
+  ) +
+  labs(x = NULL, y = NULL) +
+  theme_bw(base_size = 9) +
+  theme(
+    strip.background = element_rect(
+      fill = "#F2F2F2",
+      color = NA
+    ),
+    strip.text = element_text(size = 8, hjust = 0),
+    axis.text.x = element_text(size = 7),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "#E8E8E8",
+      linewidth = 0.2
+    ),
+    panel.border = element_rect(
+      color = "#888888",
+      linewidth = 0.3
+    ),
+    panel.spacing = grid::unit(0.8, "lines")
+  )
+```
+
+Cumulative cases and deaths increase rapidly during two periods,
+separated by slower growth. Intensive care occupancy instead
+rises and falls, showing two distinct peaks.
+
+These indicators describe different quantities: cumulative counts
+retain past events, while intensive care occupancy measures the
+number of patients occupying intensive care beds on each date.
+
+Daily new reported cases are calculated as first differences
+of cumulative cases. Each difference is assigned to the later
+of the two dates.
+
+```{r covid-daily-cases}
+nuovi_df <- data.frame(
+  date = covid$date[-1],
+  observed = nuovi_casi
+)
+
+nuovi_ts <- ts(nuovi_casi, frequency = 7)
+
+hw <- HoltWinters(
+  nuovi_ts,
+  beta = FALSE,
+  gamma = FALSE
+)
+```
+
+We fit simple exponential smoothing without trend or seasonality.
+Setting `frequency = 7` defines seven observations per time unit;
+it does not introduce a weekly seasonal component when
+`gamma = FALSE`.
+
+```{r covid-fit-data, include=FALSE}
+covid_fitted <- data.frame(
+  date = nuovi_df$date[-1],
+  fitted = as.numeric(hw$fitted[, "xhat"])
+)
+
+stopifnot(nrow(covid_fitted) == nrow(nuovi_df) - 1)
+```
+
+```{r covid-smoothing-plot, echo=FALSE, fig.width=6.4, fig.height=2.8, out.width="95%", fig.pos="H", fig.cap="Daily new reported cases and one-step-ahead fitted values from simple exponential smoothing. Daily cases are differences in cumulative reported cases and may reflect reporting practices or revisions as well as epidemic dynamics."}
+ggplot(nuovi_df, aes(x = date)) +
+  geom_line(
+    aes(y = observed, color = "Observed"),
+    linewidth = 0.4
+  ) +
+  geom_line(
+    data = covid_fitted,
+    aes(
+      y = fitted,
+      color = "One-step fitted",
+      linetype = "One-step fitted"
+    ),
+    linewidth = 0.4
+  ) +
+  scale_color_manual(
+    values = c(
+      "Observed" = "#333333",
+      "One-step fitted" = "#B36B35"
+    ),
+    breaks = c("Observed", "One-step fitted")
+  ) +
+  scale_linetype_manual(
+    values = c("One-step fitted" = "dashed"),
+    guide = "none"
+  ) +
+  scale_x_date(
+    breaks = as.Date(c(
+      "2020-04-01", "2020-07-01",
+      "2020-10-01", "2021-01-01"
+    )),
+    labels = c("Apr 2020", "Jul 2020", "Oct 2020", "Jan 2021")
+  ) +
+  scale_y_continuous(
+    labels = scales::label_number(big.mark = ",")
+  ) +
+  labs(
+    x = NULL,
+    y = "Daily new reported cases",
+    color = NULL
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "#E8E8E8",
+      linewidth = 0.2
+    ),
+    panel.border = element_rect(
+      color = "#888888",
+      linewidth = 0.3
+    ),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8)
+  )
+```
+
+The estimated smoothing parameter is
+$\alpha = `r sprintf("%.3f", hw$alpha)`$.
+Its proximity to one makes the level estimate highly responsive
+to the latest observation. Consequently, one-step-ahead fitted
+values closely follow the previous day's reported cases.
+
+The daily series also displays recurring short-term fluctuations.
+The fitted model does not explicitly represent weekly seasonality
+or changes in epidemic growth.
+
+This application illustrates smoothing and in-sample one-step
+prediction. No held-out forecast evaluation or prediction intervals
+are provided, so the plot does not establish forecasting accuracy
+or quantify uncertainty about future cases.
