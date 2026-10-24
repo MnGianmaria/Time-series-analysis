@@ -1,0 +1,942 @@
+---
+title: "Temperature Anomalies: Decomposition and Forecasting"
+author: "Gianmaria Monaco — Bocconi University — Time Series Analysis — 2025/2026 — Group 32"
+output:
+  pdf_document:
+    number_sections: true
+fontsize: 11pt
+geometry: margin=1in
+documentclass: article
+header-includes:
+  - \usepackage{float}
+  - \usepackage{caption}
+  - \captionsetup[figure]{font=small,labelfont=bf,textfont=it,labelsep=period,justification=raggedright,singlelinecheck=false,skip=6pt}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 6,
+  fig.height = 3,
+  fig.align = "center",
+  comment = "##"
+)
+
+options(width = 80)
+
+library(ggplot2)
+library(zoo)
+library(tidyr)
+library(scales)
+library(dplyr)
+library(forecast)
+```
+
+# Introduction
+
+This analysis examines long-term movements, seasonal patterns,
+and variability in monthly Northern Hemisphere surface temperature
+anomalies from GISTEMP.
+
+We first explore the observed series and compare classical additive
+and multiplicative decompositions. We then use STL to examine
+fixed and time-varying seasonal specifications, interpreting the
+estimated trend, seasonal component, and remainder.
+
+The forecasting analysis compares simple exponential smoothing
+and Holt's method using observations from January 1950 to
+December 2010. Seasonal adjustment for this stage is estimated using only
+observations dated within the training period.
+
+Forecasts from the end of 2010 are evaluated against subsequent
+observations over 2011–2025. We report prediction intervals and
+cumulative mean absolute errors over the first 1, 5, 10, and
+15 years after the forecast origin.
+
+The analysis describes statistical patterns and the performance
+of extrapolative forecasting methods; it does not identify the
+physical causes of temperature changes.
+
+# Data Preparation
+
+The dataset contains monthly Northern Hemisphere land–ocean
+temperature anomalies relative to the 1951–1980 reference period,
+expressed in degrees Celsius.
+
+Each row represents a calendar year. We extract the twelve monthly
+columns, excluding annual and seasonal summaries, and arrange the
+observations chronologically in a monthly time series.
+
+```{r data-import}
+data_url <- paste0(
+  "https://raw.githubusercontent.com/",
+  "MnGianmaria/time-series-analysis/main/",
+  "02_temperature_anomalies_and_forecasting/",
+  "data/gistemp.csv"
+)
+
+gistemp_raw <- read.csv(
+  data_url,
+  skip = 1,
+  header = TRUE,
+  na.strings = "***",
+  check.names = FALSE
+)
+
+month_names <- c(
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+)
+
+monthly_mat <- as.matrix(gistemp_raw[, month_names])
+temp_vec <- as.numeric(t(monthly_mat))
+
+stopifnot(
+  all(diff(gistemp_raw$Year) == 1),
+  all(is.finite(temp_vec))
+)
+
+gistemp_ts <- ts(
+  temp_vec,
+  start = c(gistemp_raw$Year[1], 1),
+  frequency = 12
+)
+
+gistemp_df <- data.frame(
+  date = as.Date(as.yearmon(time(gistemp_ts))),
+  value = as.numeric(gistemp_ts)
+)
+```
+
+The sample covers January 1880 to December 2025, with 1,752 monthly
+observations and no missing monthly values. Negative anomalies
+indicate temperatures below the reference-period average for the
+corresponding calendar month; positive anomalies indicate
+temperatures above it.
+
+# Temperature Dynamics
+
+We examine the monthly anomalies to identify long-term movements
+and short-term fluctuations.
+
+```{r temperature-series, echo=FALSE, fig.width=6.4, fig.height=2, out.width="95%", fig.pos="H", fig.cap="Monthly Northern Hemisphere land–ocean temperature anomalies, 1880–2025. The dashed line marks the 1951–1980 reference level."}
+ggplot(gistemp_df, aes(x = date, y = value)) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "#888888",
+    linewidth = 0.3
+  ) +
+  geom_line(color = "#24476B", linewidth = 0.3) +
+  scale_x_date(
+    breaks = as.Date(paste0(seq(1880, 2020, 20), "-01-01")),
+    date_labels = "%Y",
+    expand = expansion(mult = c(0.02, 0.02))
+  ) +
+  labs(x = "Year", y = "Temperature anomaly (°C)") +
+  theme_bw(base_size = 9) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "#E8E8E8",
+      linewidth = 0.2
+    ),
+    panel.border = element_rect(
+      color = "#888888",
+      linewidth = 0.3
+    )
+  )
+```
+
+The series shows a long-term increase interrupted by substantial
+monthly fluctuations. Warming is uneven: a relatively flat period
+around the middle of the twentieth century is followed by a more
+pronounced rise from approximately the 1970s onward. Recent
+observations remain above the reference level.
+
+# Persistence and Variability
+
+We examine autocorrelation up to 48 months and the standard
+deviation within centered 120-month windows.
+
+```{r persistence-variability, echo=FALSE, fig.width=6.4, fig.height=2.4, out.width="95%", fig.pos="H", fig.cap="Autocorrelation of monthly anomalies (A) and rolling standard deviation over centered 120-month windows (B). Dashed ACF bands are approximate white-noise reference bounds."}
+acf_values <- acf(gistemp_ts, lag.max = 48, plot = FALSE)
+
+acf_df <- data.frame(
+  lag = round(as.numeric(acf_values$lag) * frequency(gistemp_ts)),
+  correlation = as.numeric(acf_values$acf)
+)
+
+acf_df <- acf_df[acf_df$lag > 0, ]
+acf_bound <- qnorm(0.975) / sqrt(length(gistemp_ts))
+
+rolling_df <- data.frame(
+  date = gistemp_df$date,
+  sd = as.numeric(zoo::rollapply(
+    gistemp_ts,
+    width = 120,
+    FUN = sd,
+    align = "center",
+    fill = NA
+  ))
+)
+
+diagnostic_theme <- theme_bw(base_size = 8) +
+  theme(
+    plot.title = element_text(size = 9, face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.border = element_rect(
+      color = "#888888", linewidth = 0.3
+    )
+  )
+
+p_acf <- ggplot(acf_df, aes(x = lag, y = correlation)) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  geom_hline(
+    yintercept = c(-acf_bound, acf_bound),
+    linetype = "dashed",
+    color = "#888888",
+    linewidth = 0.3
+  ) +
+  geom_segment(
+    aes(xend = lag, yend = 0),
+    color = "#24476B",
+    linewidth = 0.35
+  ) +
+  scale_x_continuous(breaks = seq(0, 48, 12)) +
+  labs(title = "A  Autocorrelation", x = "Lag (months)", y = "ACF") +
+  diagnostic_theme
+
+p_sd <- ggplot(rolling_df, aes(x = date, y = sd)) +
+  geom_line(
+    color = "#24476B",
+    linewidth = 0.35,
+    na.rm = TRUE
+  ) +
+  scale_x_date(
+    breaks = as.Date(paste0(seq(1900, 2020, 40), "-01-01")),
+    date_labels = "%Y"
+  ) +
+  labs(
+    title = "B  Rolling standard deviation",
+    x = "Year",
+    y = "Standard deviation (°C)"
+  ) +
+  diagnostic_theme
+
+diagnostic_grobs <- lapply(list(p_acf, p_sd), ggplotGrob)
+
+common_heights <- do.call(
+  grid::unit.pmax,
+  lapply(diagnostic_grobs, function(g) g$heights)
+)
+
+grid::grid.newpage()
+grid::pushViewport(
+  grid::viewport(layout = grid::grid.layout(1, 2))
+)
+
+for (i in seq_along(diagnostic_grobs)) {
+  diagnostic_grobs[[i]]$heights <- common_heights
+  grid::pushViewport(
+    grid::viewport(layout.pos.row = 1, layout.pos.col = i)
+  )
+  grid::grid.draw(diagnostic_grobs[[i]])
+  grid::popViewport()
+}
+
+grid::popViewport()
+```
+
+Autocorrelations remain high across the displayed lags, indicating
+strong persistence consistent with the long-term movement.
+This is not a formal test of non-stationarity.
+
+The rolling standard deviation varies over time without a steady
+increase across the full sample. Since each window also contains
+local trend movements, this measure does not isolate the variance
+of the irregular component.
+
+# Classical Decomposition
+
+We compare additive decomposition, $Y_t = T_t + S_t + R_t$,
+with multiplicative decomposition, $Y_t = T_t S_t R_t$.
+Both estimate the trend using centered moving averages and impose
+a repeating seasonal pattern.
+
+Temperature anomalies include negative values and cross zero,
+making proportional seasonal factors difficult to interpret.
+The multiplicative specification is retained as a diagnostic comparison.
+
+```{r classical-decomposition-data, include=FALSE}
+dec_add <- decompose(gistemp_ts, type = "additive")
+dec_mult <- decompose(gistemp_ts, type = "multiplicative")
+
+make_dec_df <- function(fit) {
+  result <- pivot_longer(
+    data.frame(
+      date = gistemp_df$date,
+      Observed = as.numeric(fit$x),
+      Trend = as.numeric(fit$trend),
+      Seasonal = as.numeric(fit$seasonal),
+      Remainder = as.numeric(fit$random)
+    ),
+    cols = -date,
+    names_to = "component",
+    values_to = "value"
+  )
+
+  result$component <- factor(
+    result$component,
+    levels = c("Observed", "Trend", "Seasonal", "Remainder")
+  )
+
+  result
+}
+
+dec_add_df <- make_dec_df(dec_add)
+dec_mult_df <- make_dec_df(dec_mult)
+```
+
+```{r classical-decomposition-plot, echo=FALSE, fig.width=6.4, fig.height=4, out.width="90%", fig.pos="H", fig.cap="Classical additive (A) and multiplicative (B) decompositions. Vertical scales vary across panels. Additive components are in degrees Celsius; multiplicative seasonal and remainder components are ratios."}
+climate_dec_plot <- function(data, title) {
+  ggplot(data, aes(x = date, y = value)) +
+    geom_line(
+      color = "#243746",
+      linewidth = 0.25,
+      na.rm = TRUE
+    ) +
+    facet_wrap(~component, ncol = 1, scales = "free_y") +
+    scale_x_date(
+      breaks = as.Date(paste0(c(1900, 1950, 2000), "-01-01")),
+      date_labels = "%Y"
+    ) +
+    scale_y_continuous(
+      breaks = scales::breaks_pretty(n = 3)
+    ) +
+    labs(title = title, x = NULL, y = NULL) +
+    theme_bw(base_size = 8) +
+    theme(
+      plot.title = element_text(
+        size = 9, face = "bold", hjust = 0
+      ),
+      strip.background = element_rect(
+        fill = "#F2F2F2", color = NA
+      ),
+      strip.text = element_text(size = 8),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      panel.grid.major.y = element_line(
+        color = "#E8E8E8", linewidth = 0.2
+      ),
+      panel.border = element_rect(
+        color = "#888888", linewidth = 0.3
+      ),
+      panel.spacing = grid::unit(0.6, "lines"),
+      axis.text = element_text(size = 7, color = "#333333"),
+      plot.margin = margin(4, 6, 4, 4)
+    )
+}
+
+dec_plots <- list(
+  climate_dec_plot(dec_add_df, "A  Additive"),
+  climate_dec_plot(dec_mult_df, "B  Multiplicative")
+)
+
+dec_grobs <- lapply(dec_plots, ggplotGrob)
+
+common_widths <- do.call(
+  grid::unit.pmax,
+  lapply(dec_grobs, function(g) g$widths)
+)
+
+common_heights <- do.call(
+  grid::unit.pmax,
+  lapply(dec_grobs, function(g) g$heights)
+)
+
+grid::grid.newpage()
+grid::pushViewport(
+  grid::viewport(layout = grid::grid.layout(1, 2))
+)
+
+for (i in seq_along(dec_grobs)) {
+  dec_grobs[[i]]$widths <- common_widths
+  dec_grobs[[i]]$heights <- common_heights
+
+  grid::pushViewport(
+    grid::viewport(layout.pos.row = 1, layout.pos.col = i)
+  )
+  grid::grid.draw(dec_grobs[[i]])
+  grid::popViewport()
+}
+
+grid::popViewport()
+```
+
+The trend estimates coincide because both specifications use the
+same moving-average filter. They show an uneven long-term increase,
+with stronger warming in the later decades.
+
+The multiplicative remainder exhibits extreme spikes when its
+denominator, the product of trend and seasonal components, approaches
+zero. These ratios are sensitive to the chosen anomaly baseline.
+We therefore use an additive representation for subsequent analysis.
+The additive remainder still requires examination; its appearance
+alone does not establish white noise.
+
+# Fixed and Time-Varying Seasonality
+
+We compare robust STL with a fixed annual seasonal pattern
+(`s.window = "periodic"`) and a pattern allowed to evolve over time
+(`s.window = 13`). Robust fitting reduces the influence of unusually
+large remainder values.
+
+```{r stl-comparison-data, include=FALSE}
+stl_periodic <- stl(
+  gistemp_ts,
+  s.window = "periodic",
+  robust = TRUE
+)
+
+stl_varying <- stl(
+  gistemp_ts,
+  s.window = 13,
+  robust = TRUE
+)
+
+make_stl_df <- function(fit, specification) {
+  pivot_longer(
+    data.frame(
+      date = gistemp_df$date,
+      Observed = as.numeric(gistemp_ts),
+      Trend = as.numeric(fit$time.series[, "trend"]),
+      Seasonal = as.numeric(fit$time.series[, "seasonal"]),
+      Remainder = as.numeric(fit$time.series[, "remainder"])
+    ),
+    cols = -date,
+    names_to = "component",
+    values_to = "value"
+  ) %>%
+    mutate(specification = specification)
+}
+
+stl_comparison <- bind_rows(
+  make_stl_df(stl_periodic, "A  Fixed seasonality"),
+  make_stl_df(stl_varying, "B  Time-varying seasonality")
+)
+
+stl_comparison$component <- factor(
+  stl_comparison$component,
+  levels = c("Observed", "Trend", "Seasonal", "Remainder")
+)
+```
+
+```{r stl-comparison-plot, echo=FALSE, fig.width=6.4, fig.height=4, out.width="90%", fig.pos="H", fig.cap="Robust STL with fixed (A) and time-varying (B) seasonality. Components are expressed in degrees Celsius. Each row shares a vertical scale across the two specifications."}
+ggplot(stl_comparison, aes(x = date, y = value)) +
+  geom_line(color = "#243746", linewidth = 0.25) +
+  facet_grid(
+    component ~ specification,
+    scales = "free_y"
+  ) +
+  scale_x_date(
+    breaks = as.Date(paste0(c(1900, 1950, 2000), "-01-01")),
+    date_labels = "%Y"
+  ) +
+  scale_y_continuous(
+    breaks = scales::breaks_pretty(n = 3)
+  ) +
+  labs(x = "Year", y = NULL) +
+  theme_bw(base_size = 8) +
+  theme(
+    strip.background = element_rect(
+      fill = "#F2F2F2", color = NA
+    ),
+    strip.text = element_text(size = 8),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "#E8E8E8", linewidth = 0.2
+    ),
+    panel.border = element_rect(
+      color = "#888888", linewidth = 0.3
+    ),
+    panel.spacing = grid::unit(0.6, "lines"),
+    axis.text = element_text(size = 7, color = "#333333")
+  )
+```
+
+Both specifications recover a similar long-term warming pattern.
+The flexible specification allocates more variation to the seasonal
+component, but this alone does not establish that the variation
+represents a stable seasonal signal.
+
+We retain fixed seasonality as a parsimonious working specification
+for forecasting. This is a modelling choice, rather than evidence
+that seasonality is constant or that the flexible fit overfits.
+
+# Seasonal Pattern and Remainder
+
+We examine the monthly seasonal effects and the remainder from
+classical additive decomposition.
+
+```{r seasonal-remainder-data, include=FALSE}
+seasonal_df <- data.frame(
+  month = factor(month.abb, levels = month.abb),
+  value = as.numeric(dec_add$figure)
+)
+
+remainder_df <- data.frame(
+  date = gistemp_df$date,
+  value = as.numeric(dec_add$random)
+)
+```
+
+```{r seasonal-remainder-plot, echo=FALSE, fig.width=6.4, fig.height=2, out.width="95%", fig.pos="H", fig.cap="Monthly seasonal effects (A) and remainder over time (B) from classical additive decomposition, in degrees Celsius."}
+p_seasonal <- ggplot(seasonal_df, aes(x = month, y = value)) +
+  geom_col(fill = "#24476B", width = 0.7) +
+  geom_hline(
+    yintercept = 0,
+    color = "#888888",
+    linewidth = 0.3
+  ) +
+  labs(
+    title = "A  Monthly seasonal effects",
+    x = NULL,
+    y = "Seasonal effect (°C)"
+  ) +
+  diagnostic_theme +
+  theme(axis.text.x = element_text(size = 6))
+
+p_remainder <- ggplot(remainder_df, aes(x = date, y = value)) +
+  geom_hline(
+    yintercept = 0,
+    color = "#888888",
+    linewidth = 0.3
+  ) +
+  geom_line(
+    color = "#24476B",
+    linewidth = 0.25,
+    na.rm = TRUE
+  ) +
+  scale_x_date(
+    breaks = as.Date(paste0(c(1900, 1950, 2000), "-01-01")),
+    date_labels = "%Y"
+  ) +
+  labs(
+    title = "B  Remainder",
+    x = "Year",
+    y = "Remainder (°C)"
+  ) +
+  diagnostic_theme
+
+seasonal_grobs <- lapply(
+  list(p_seasonal, p_remainder),
+  ggplotGrob
+)
+
+common_heights <- do.call(
+  grid::unit.pmax,
+  lapply(seasonal_grobs, function(g) g$heights)
+)
+
+grid::grid.newpage()
+grid::pushViewport(
+  grid::viewport(layout = grid::grid.layout(1, 2))
+)
+
+for (i in seq_along(seasonal_grobs)) {
+  seasonal_grobs[[i]]$heights <- common_heights
+
+  grid::pushViewport(
+    grid::viewport(layout.pos.row = 1, layout.pos.col = i)
+  )
+  grid::grid.draw(seasonal_grobs[[i]])
+  grid::popViewport()
+}
+
+grid::popViewport()
+```
+
+The estimated monthly effects are small, with positive peaks
+in March and October and negative effects in several summer
+and winter months. These are patterns in temperature anomalies,
+not the annual cycle of absolute temperatures; their physical
+causes cannot be inferred from this decomposition.
+
+The remainder fluctuates around zero with occasional large
+deviations, particularly early in the record. These represent
+variation left unexplained by the estimated trend and fixed
+seasonal pattern.
+
+# Exponential Smoothing
+
+We seasonally adjust the January 1950–December 2010 sample using
+robust periodic STL fitted to that sample only. We then compare
+simple exponential smoothing (SES), which updates a level,
+with Holt's method, which also updates a trend.
+
+```{r smoothing-models, include=FALSE}
+train_raw <- window(
+  gistemp_ts,
+  start = c(1950, 1),
+  end = c(2010, 12)
+)
+
+stl_train <- stl(
+  train_raw,
+  s.window = "periodic",
+  robust = TRUE
+)
+
+deseas_sub <- train_raw - stl_train$time.series[, "seasonal"]
+
+ses_fit <- HoltWinters(
+  deseas_sub,
+  beta = FALSE,
+  gamma = FALSE
+)
+
+hw_fit <- HoltWinters(
+  deseas_sub,
+  beta = NULL,
+  gamma = FALSE
+)
+
+smoothing_models <- list(
+  "A  SES" = ses_fit,
+  "B  Holt" = hw_fit
+)
+
+smoothing_observed <- data.frame(
+  date = as.Date(as.yearmon(time(deseas_sub))),
+  value = as.numeric(deseas_sub)
+)
+
+smoothing_fitted <- bind_rows(
+  lapply(names(smoothing_models), function(model_name) {
+    fit <- smoothing_models[[model_name]]
+
+    data.frame(
+      date = as.Date(as.yearmon(time(fit$fitted))),
+      value = as.numeric(fit$fitted[, "xhat"]),
+      model = model_name
+    )
+  })
+)
+```
+
+```{r smoothing-comparison, echo=FALSE, fig.width=6.4, fig.height=3, out.width="90%", fig.pos="H", fig.cap="Seasonally adjusted training observations and one-step-ahead fitted values from SES and Holt, 1950–2010. Both panels share the same axes."}
+ggplot() +
+  geom_line(
+    data = smoothing_observed,
+    aes(x = date, y = value, color = "Observed"),
+    linewidth = 0.3
+  ) +
+  geom_line(
+    data = smoothing_fitted,
+    aes(x = date, y = value, color = "One-step fitted"),
+    linewidth = 0.35
+  ) +
+  facet_wrap(~model, ncol = 1) +
+  scale_color_manual(
+    values = c(
+      "Observed" = "#555555",
+      "One-step fitted" = "#B36B35"
+    ),
+    breaks = c("Observed", "One-step fitted")
+  ) +
+  scale_x_date(
+    breaks = as.Date(paste0(c(1950, 1970, 1990, 2010), "-01-01")),
+    date_labels = "%Y"
+  ) +
+  labs(
+    x = "Year",
+    y = "Adjusted anomaly (°C)",
+    color = NULL
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    strip.background = element_rect(
+      fill = "#F2F2F2", color = NA
+    ),
+    strip.text = element_text(hjust = 0),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8)
+  )
+```
+
+The estimated level smoothing parameters are
+$\alpha = `r sprintf("%.3f", ses_fit$alpha)`$ for SES and
+$\alpha = `r sprintf("%.3f", hw_fit$alpha)`$ for Holt.
+Holt's trend smoothing parameter is
+$\beta = `r sprintf("%.3f", hw_fit$beta)`$.
+Parameters are selected by minimizing the in-sample sum of squared
+one-step-ahead errors.
+
+These fitted values use preceding observations, but their smoothing
+parameters and seasonal adjustment are estimated from the full
+training sample. Their fit therefore does not establish performance
+on unseen data.
+
+We next fix Holt's level smoothing parameter at 0.1 and 0.9,
+re-estimating the trend smoothing parameter in each case.
+
+```{r alpha-sensitivity-data, include=FALSE}
+holt_low <- HoltWinters(
+  deseas_sub, alpha = 0.1, beta = NULL, gamma = FALSE
+)
+
+holt_high <- HoltWinters(
+  deseas_sub, alpha = 0.9, beta = NULL, gamma = FALSE
+)
+
+alpha_models <- list(
+  "A  Alpha = 0.1" = holt_low,
+  "B  Alpha = 0.9" = holt_high
+)
+
+alpha_fitted <- bind_rows(
+  lapply(names(alpha_models), function(model_name) {
+    fit <- alpha_models[[model_name]]
+
+    data.frame(
+      date = as.Date(as.yearmon(time(fit$fitted))),
+      value = as.numeric(fit$fitted[, "xhat"]),
+      model = model_name
+    )
+  })
+)
+```
+
+```{r alpha-sensitivity-plot, echo=FALSE, fig.width=6.4, fig.height=3, out.width="90%", fig.pos="H", fig.cap="Holt one-step-ahead fitted values with alpha fixed at 0.1 and 0.9. Beta is estimated separately for each specification; both panels share the same axes."}
+ggplot() +
+  geom_line(
+    data = smoothing_observed,
+    aes(x = date, y = value, color = "Observed"),
+    linewidth = 0.3
+  ) +
+  geom_line(
+    data = alpha_fitted,
+    aes(x = date, y = value, color = "One-step fitted"),
+    linewidth = 0.35
+  ) +
+  facet_wrap(~model, ncol = 1) +
+  scale_color_manual(
+    values = c(
+      "Observed" = "#555555",
+      "One-step fitted" = "#B36B35"
+    ),
+    breaks = c("Observed", "One-step fitted")
+  ) +
+  scale_x_date(
+    breaks = as.Date(paste0(c(1950, 1970, 1990, 2010), "-01-01")),
+    date_labels = "%Y"
+  ) +
+  labs(
+    x = "Year",
+    y = "Adjusted anomaly (°C)",
+    color = NULL
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    strip.background = element_rect(
+      fill = "#F2F2F2", color = NA
+    ),
+    strip.text = element_text(hjust = 0),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8)
+  )
+```
+
+A larger alpha gives the latest observation greater weight in the
+level update. The comparison also reflects the separately estimated
+beta values: `r sprintf("%.3f", holt_low$beta)` for alpha = 0.1 and
+`r sprintf("%.3f", holt_high$beta)` for alpha = 0.9.
+Responsiveness alone does not establish better forecast accuracy.
+
+# Forecast Evaluation
+
+The Holt model estimated on the seasonally adjusted 1950–2010 sample
+produces forecasts for January 2011 through December 2025, without
+re-estimation. Test observations are adjusted using the monthly seasonal
+effects estimated on the training sample.
+
+```{r forecast-data, include=FALSE}
+test_raw <- window(
+  gistemp_ts,
+  start = c(2011, 1),
+  end = c(2025, 12)
+)
+
+training_seasonal_effects <- tapply(
+  stl_train$time.series[, "seasonal"],
+  cycle(train_raw),
+  mean
+)
+
+test_adjusted <- ts(
+  as.numeric(test_raw) -
+    training_seasonal_effects[cycle(test_raw)],
+  start = start(test_raw),
+  frequency = frequency(test_raw)
+)
+
+holt_fc <- forecast::forecast(
+  hw_fit,
+  h = length(test_adjusted),
+  level = c(80, 95)
+)
+
+stopifnot(
+  length(test_adjusted) == 180L,
+  all(is.finite(test_adjusted)),
+  isTRUE(all.equal(
+    as.numeric(time(test_adjusted)),
+    as.numeric(time(holt_fc$mean))
+  ))
+)
+
+forecast_df <- data.frame(
+  date = as.Date(as.yearmon(time(holt_fc$mean))),
+  mean = as.numeric(holt_fc$mean),
+  lower80 = as.numeric(holt_fc$lower[, "80%"]),
+  upper80 = as.numeric(holt_fc$upper[, "80%"]),
+  lower95 = as.numeric(holt_fc$lower[, "95%"]),
+  upper95 = as.numeric(holt_fc$upper[, "95%"])
+)
+
+observed_df <- data.frame(
+  date = c(
+    as.Date(as.yearmon(time(deseas_sub))),
+    as.Date(as.yearmon(time(test_adjusted)))
+  ),
+  value = c(
+    as.numeric(deseas_sub),
+    as.numeric(test_adjusted)
+  )
+)
+```
+
+```{r forecast-plot, echo=FALSE, fig.width=6.4, fig.height=3, out.width="95%", fig.pos="H", fig.cap="Holt forecasts from the end of 2010, with 80% and 95% prediction intervals. Observations are seasonally adjusted using training-sample estimates. The dashed line marks the start of the test period. Intervals are conditional on the fitted model and exclude uncertainty in seasonal adjustment."}
+ggplot() +
+  geom_ribbon(
+    data = forecast_df,
+    aes(x = date, ymin = lower95, ymax = upper95),
+    fill = "#24476B",
+    alpha = 0.12
+  ) +
+  geom_ribbon(
+    data = forecast_df,
+    aes(x = date, ymin = lower80, ymax = upper80),
+    fill = "#24476B",
+    alpha = 0.22
+  ) +
+  geom_line(
+    data = observed_df,
+    aes(x = date, y = value, color = "Observed"),
+    linewidth = 0.3
+  ) +
+  geom_line(
+    data = forecast_df,
+    aes(x = date, y = mean, color = "Forecast"),
+    linewidth = 0.5
+  ) +
+  geom_vline(
+    xintercept = as.numeric(as.Date("2011-01-01")),
+    linetype = "dashed",
+    color = "#888888",
+    linewidth = 0.3
+  ) +
+  scale_color_manual(
+    values = c(
+      "Observed" = "#555555",
+      "Forecast" = "#24476B"
+    ),
+    breaks = c("Observed", "Forecast"),
+    name = NULL
+  ) +
+  scale_x_date(
+    breaks = as.Date(c(
+      "1950-01-01", "1970-01-01",
+      "1990-01-01", "2010-01-01", "2025-01-01"
+    )),
+    date_labels = "%Y"
+  ) +
+  labs(
+    x = "Year",
+    y = "Adjusted anomaly (°C)"
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8)
+  )
+```
+The point forecasts extend the estimated trend, while observations
+in the later test years generally lie above the forecast path.
+Prediction intervals widen substantially over the fifteen-year horizon.
+
+Forecast accuracy is summarized using mean absolute error (MAE)
+over the first 12, 60, 120, and 180 test months. Each value averages
+all monthly absolute errors up to the indicated horizon; it is not
+the error at the endpoint alone.
+
+```{r forecast-mae, echo=FALSE}
+forecast_errors <- (
+  as.numeric(test_adjusted) -
+    as.numeric(holt_fc$mean)
+)
+
+horizons <- c(12L, 60L, 120L, 180L)
+
+mae_results <- data.frame(
+  Horizon = c("1 year", "5 years", "10 years", "15 years"),
+  Months = horizons,
+  MAE = vapply(
+    horizons,
+    function(h) {
+      mean(abs(forecast_errors[seq_len(h)]))
+    },
+    numeric(1)
+  )
+)
+
+knitr::kable(
+  mae_results,
+  col.names = c("Evaluation horizon", "Months", "MAE (°C)"),
+  digits = 3,
+  row.names = FALSE,
+  caption = "Cumulative forecast MAE from January 2011."
+)
+```
+Cumulative MAE increases from 0.120 °C over the first year to
+0.239 °C over fifteen years. Average absolute errors are therefore
+higher when later test observations are included. These results
+describe a single forecast origin and do not establish how accuracy
+would vary across different estimation periods.
+
+# Discussion and Limitations
+
+Additive decomposition is appropriate for temperature anomalies,
+which include negative and near-zero values. STL illustrates how
+allowing seasonal effects to vary changes the allocation between
+seasonality and remainder. The Holt forecasts extend the estimated
+trend but generally underpredict anomalies in the later test years.
+
+The evaluation uses one chronological split and a dataset retrieved
+after the forecast origin, rather than the data vintage available
+in 2010. Prediction intervals depend on the model assumptions and
+exclude uncertainty in seasonal adjustment. The analysis provides
+a statistical description and forecasting illustration, without
+identifying the causes of temperature changes.
