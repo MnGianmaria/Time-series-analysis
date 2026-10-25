@@ -1,0 +1,877 @@
+---
+title: "Nile Flow: Filtering and Smoothing with a Dynamic Linear Model"
+author: "Gianmaria Monaco | Bocconi University | Time Series Analysis | Group 32"
+output:
+  pdf_document:
+    number_sections: true
+fontsize: 11pt
+geometry: margin=1in
+documentclass: article
+header-includes:
+  - \usepackage{float}
+  - \usepackage{booktabs}
+  - \usepackage{caption}
+  - \captionsetup[figure]{font=small,labelfont=bf,textfont=it,labelsep=period,justification=raggedright,singlelinecheck=false,skip=6pt}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 6,
+  fig.height = 2,
+  out.width = "95%",
+  fig.align = "center",
+  fig.pos = "H"
+)
+
+library(ggplot2)
+library(dlm)
+library(knitr)
+
+y <- datasets::Nile
+
+nile_data <- data.frame(
+  Year = as.numeric(time(y)),
+  Flow = as.numeric(y)
+)
+
+V_known <- 15100
+W_known <- 1470
+m0 <- 1000
+C0 <- 1000
+
+nile_model <- dlmModPoly(
+  order = 1,
+  dV = V_known,
+  dW = W_known,
+  m0 = m0,
+  C0 = C0
+)
+```
+
+# Introduction
+
+This analysis uses a dynamic linear model to describe changes
+in the underlying level of annual Nile flow. We distinguish
+sequential state estimation through Kalman filtering,
+one-step-ahead prediction, and retrospective reconstruction
+through smoothing.
+
+We also examine sensitivity to the signal-to-noise ratio,
+check standardized forecast errors, and estimate the observation
+and state innovation variances by maximum likelihood.
+
+# Data and Model Specification
+
+The Nile dataset, included in R, contains 100 annual observations
+of river flow at Aswan from 1871 to 1970, measured in
+$10^8\,\mathrm{m}^3$. The series shows a marked decline around
+the end of the nineteenth century.
+
+```{r nile-series-plot, fig.width=6, fig.height=2, out.width="95%", fig.cap="Annual Nile flow at Aswan, 1871–1970. Data are available in R through the Nile dataset."}
+ggplot(nile_data, aes(x = Year, y = Flow)) +
+  geom_line(
+    color = "#243746",
+    linewidth = 0.4
+  ) +
+  geom_point(
+    color = "#243746",
+    size = 0.9
+  ) +
+  scale_x_continuous(
+    breaks = seq(1880, 1960, 20)
+  ) +
+  labs(
+    x = "Year",
+    y = expression("Annual flow (" * 10^8 * " " * m^3 * ")")
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "#E8E8E8",
+      linewidth = 0.2
+    ),
+    panel.border = element_rect(
+      color = "#888888",
+      linewidth = 0.3
+    )
+  )
+```
+
+We use a local level model, also called a random walk plus noise:
+
+\[
+\begin{aligned}
+y_t &= \theta_t + v_t,
+& v_t &\sim \mathcal{N}(0,V),\\
+\theta_t &= \theta_{t-1} + w_t,
+& w_t &\sim \mathcal{N}(0,W).
+\end{aligned}
+\]
+
+The observation errors and state innovations are independent
+over time and mutually independent, and are independent of
+the initial state.
+
+For the initial analysis, the variances are treated as fixed
+at \(V=15100\) and \(W=1470\), with initial distribution
+
+\[
+\theta_0 \sim \mathcal{N}(1000,1000),
+\]
+
+where the second parameter is the variance.
+The latent level can change over time, although the model
+does not explicitly specify a discrete change point.
+
+# Kalman Filtering
+
+The Kalman filter updates the estimated level as each observation
+becomes available. The filtering distribution is
+
+\[
+\theta_t \mid y_{1:t} \sim \mathcal{N}(m_t,C_t),
+\]
+
+where \(m_t\) is the estimated level and \(C_t\) measures its
+remaining uncertainty after observing \(y_t\).
+
+```{r kalman-filter}
+nile_filter <- dlmFilter(y, nile_model)
+
+filter_mean <- as.numeric(dropFirst(nile_filter$m))
+
+filter_covariances <- dlmSvd2var(
+  nile_filter$U.C,
+  nile_filter$D.C
+)
+
+filter_variance_all <- vapply(
+  filter_covariances,
+  function(x) as.numeric(x[1, 1]),
+  numeric(1)
+)
+
+filter_variance <- filter_variance_all[-1]
+filter_sd <- sqrt(filter_variance)
+
+filter_data <- data.frame(
+  Year = nile_data$Year,
+  Flow = nile_data$Flow,
+  Mean = filter_mean,
+  SD = filter_sd,
+  Lower = filter_mean - qnorm(0.975) * filter_sd,
+  Upper = filter_mean + qnorm(0.975) * filter_sd
+)
+
+stopifnot(
+  length(filter_mean) == length(y),
+  length(filter_variance_all) == length(y) + 1,
+  all(is.finite(filter_mean)),
+  all(is.finite(filter_variance)),
+  all(filter_variance > 0)
+)
+```
+
+```{r filtering-uncertainty-plot, fig.height=1.5, fig.cap="Filtering standard deviation of the latent level, conditional on the specified variances and initial distribution."}
+ggplot(filter_data, aes(x = Year, y = SD)) +
+  geom_line(
+    color = "#243746",
+    linewidth = 0.5
+  ) +
+  scale_x_continuous(
+    breaks = seq(1880, 1960, 20)
+  ) +
+  labs(
+    x = "Year",
+    y = "Filtered state SD"
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+The filtering standard deviation initially increases and then
+stabilizes. The initial variance is below its steady-state value:
+new observations reduce uncertainty, but state innovations
+introduce additional uncertainty at every step. Consequently,
+the filtering variance does not converge to zero.
+
+```{r filtered-level-plot, fig.cap="Observed Nile flow and filtered latent level. The shaded band gives pointwise 95 percent credible intervals for the state, conditional on the specified model parameters."}
+ggplot(filter_data, aes(x = Year)) +
+  geom_ribbon(
+    aes(ymin = Lower, ymax = Upper),
+    fill = "#24476B",
+    alpha = 0.16
+  ) +
+  geom_line(
+    aes(y = Flow, color = "Observed flow"),
+    linewidth = 0.35
+  ) +
+  geom_line(
+    aes(y = Mean, color = "Filtered level"),
+    linewidth = 0.6
+  ) +
+  scale_color_manual(
+    values = c(
+      "Observed flow" = "#999999",
+      "Filtered level" = "#24476B"
+    ),
+    name = NULL
+  ) +
+  scale_x_continuous(
+    breaks = seq(1880, 1960, 20)
+  ) +
+  labs(
+    x = "Year",
+    y = expression("Annual flow (" * 10^8 * " " * m^3 * ")")
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+The filtered level follows the decline around the end of the
+nineteenth century while attenuating annual fluctuations.
+Because each estimate uses only observations available up to
+that year, adjustment to the decline occurs progressively.
+
+The credible band becomes approximately constant in width
+as the filtering variance stabilizes. It describes uncertainty
+about the latent level, rather than the range of future
+observed flows; observations can therefore lie outside it
+without directly contradicting its stated coverage.
+
+# One-Step-Ahead Prediction
+
+Before observing \(y_t\), the model gives the predictive distribution
+
+\[
+y_t \mid y_{1:t-1} \sim \mathcal{N}(f_t,Q_t),
+\qquad
+f_t=m_{t-1},
+\qquad
+Q_t=C_{t-1}+W+V.
+\]
+
+The forecast mean equals the previous filtered level.
+Predictive uncertainty includes uncertainty about that level,
+the next state innovation, and observation noise.
+
+```{r one-step-predictions}
+forecast_mean <- as.numeric(nile_filter$f)
+
+forecast_variance <- head(
+  filter_variance_all,
+  -1
+) + W_known + V_known
+
+forecast_sd <- sqrt(forecast_variance)
+
+forecast_data <- data.frame(
+  Year = nile_data$Year,
+  Flow = nile_data$Flow,
+  Forecast = forecast_mean,
+  Lower = forecast_mean - qnorm(0.975) * forecast_sd,
+  Upper = forecast_mean + qnorm(0.975) * forecast_sd
+)
+
+stopifnot(
+  length(forecast_mean) == length(y),
+  length(forecast_variance) == length(y),
+  all(is.finite(forecast_mean)),
+  all(forecast_variance > 0),
+  isTRUE(all.equal(
+    forecast_mean,
+    c(m0, head(filter_mean, -1)),
+    check.attributes = FALSE
+  ))
+)
+```
+
+```{r one-step-prediction-plot, fig.width=6, fig.height=2.5, out.width="95%", fig.cap="Observed Nile flow and one-step-ahead forecast means. The shaded band gives pointwise 95 percent prediction intervals for observed flow, conditional on the specified model parameters."}
+ggplot(forecast_data, aes(x = Year)) +
+  geom_ribbon(
+    aes(ymin = Lower, ymax = Upper),
+    fill = "#24476B",
+    alpha = 0.16
+  ) +
+  geom_line(
+    aes(y = Flow, color = "Observed flow"),
+    linewidth = 0.35
+  ) +
+  geom_line(
+    aes(y = Forecast, color = "One-step-ahead forecast"),
+    linewidth = 0.6
+  ) +
+  scale_color_manual(
+    values = c(
+      "Observed flow" = "#999999",
+      "One-step-ahead forecast" = "#24476B"
+    ),
+    name = NULL
+  ) +
+  scale_x_continuous(
+    breaks = seq(1880, 1960, 20)
+  ) +
+  labs(
+    x = "Year",
+    y = expression("Annual flow (" * 10^8 * " " * m^3 * ")")
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+The forecasts follow the broad changes in flow but adjust
+with a delay, since each prediction equals the previous
+filtered level. This is particularly visible around the
+decline at the end of the nineteenth century.
+
+Prediction intervals are wider than the filtering credible
+intervals because they describe uncertainty about an observation
+not yet seen and include observation noise. Their calibration
+will be examined through standardized forecast errors.
+
+# Signal-to-Noise Sensitivity
+
+The ratio \(W/V\) influences how strongly the filter responds
+to new observations. We vary the observation variance \(V\)
+while holding \(W\) fixed, and then vary \(W\) while holding
+\(V\) fixed. The initial distribution remains unchanged.
+
+The plot focuses on 1890–1950. These configurations illustrate
+sensitivity to the assumed variances; they are not selected
+through forecast performance.
+
+```{r signal-to-noise-models}
+sensitivity_settings <- data.frame(
+  Model = c(
+    "Higher V",
+    "Baseline",
+    "Lower V",
+    "Lower W",
+    "Higher W"
+  ),
+  V = c(150000, V_known, 1500, V_known, V_known),
+  W = c(W_known, W_known, W_known, W_known / 10, W_known * 10)
+)
+
+sensitivity_settings$Ratio <-
+  sensitivity_settings$W / sensitivity_settings$V
+
+sensitivity_labels <- sprintf(
+  "%s (W/V = %.3f)",
+  sensitivity_settings$Model,
+  sensitivity_settings$Ratio
+)
+
+sensitivity_data <- do.call(
+  rbind,
+  lapply(seq_len(nrow(sensitivity_settings)), function(i) {
+    model <- dlmModPoly(
+      order = 1,
+      dV = sensitivity_settings$V[i],
+      dW = sensitivity_settings$W[i],
+      m0 = m0,
+      C0 = C0
+    )
+
+    fitted_filter <- dlmFilter(y, model)
+
+    data.frame(
+      Year = nile_data$Year,
+      Forecast = as.numeric(fitted_filter$f),
+      Model = sensitivity_labels[i]
+    )
+  })
+)
+
+sensitivity_data$Model <- factor(
+  sensitivity_data$Model,
+  levels = sensitivity_labels
+)
+
+sensitivity_zoom <- subset(
+  sensitivity_data,
+  Year >= 1890 & Year <= 1950
+)
+
+observed_zoom <- subset(
+  nile_data,
+  Year >= 1890 & Year <= 1950
+)
+```
+
+```{r signal-to-noise-plot, fig.width=6, fig.height=3, out.width="95%", fig.cap="One-step-ahead forecasts under five variance configurations, shown for 1890–1950. Observation variance V and state innovation variance W are varied separately around the baseline, keeping the initial distribution fixed."}
+ggplot() +
+  geom_line(
+    data = observed_zoom,
+    aes(x = Year, y = Flow),
+    color = "#AAAAAA",
+    linewidth = 0.35
+  ) +
+  geom_line(
+    data = sensitivity_zoom,
+    aes(
+      x = Year,
+      y = Forecast,
+      color = Model,
+      linetype = Model
+    ),
+    linewidth = 0.55
+  ) +
+  scale_color_manual(
+    values = c(
+      "#63876B", "#24476B", "#B36B35",
+      "#806491", "#508C95"
+    ),
+    name = NULL
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "dotted", "solid", "dashed",
+      "dotdash", "longdash"
+    ),
+    name = NULL
+  ) +
+  scale_x_continuous(
+    breaks = seq(1890, 1950, 10)
+  ) +
+  labs(
+    x = "Year",
+    y = expression("Annual flow (" * 10^8 * " " * m^3 * ")")
+  ) +
+  guides(
+  color = guide_legend(nrow = 2, byrow = TRUE),
+  linetype = guide_legend(nrow = 2, byrow = TRUE)
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    legend.position = "bottom",
+    legend.text = element_text(size = 8),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+Increasing \(W\) or decreasing \(V\) gives new observations
+more weight in the filtering update, making subsequent
+forecasts more responsive to annual fluctuations. Decreasing
+\(W\) or increasing \(V\) produces smoother forecasts that
+adjust more slowly to changes in the observed level.
+
+Similar ratios can produce similar forecast paths, so some
+curves may overlap. However, the ratio alone does not determine
+the uncertainty of the state estimates or forecasts, and the
+fixed initial variance also affects the early filtering updates.
+
+Greater responsiveness does not itself imply better forecasts:
+this comparison illustrates the effect of the assumed variances,
+rather than establishing which configuration predicts best.
+
+# Forecast Error Diagnostics
+
+We assess the baseline model using standardized one-step-ahead
+forecast errors:
+
+\[
+z_t=\frac{y_t-f_t}{\sqrt{Q_t}}.
+\]
+
+Under the specified Gaussian model with known parameters,
+these errors are independent standard normal variables.
+We examine their time pattern, autocorrelation, and normal
+quantile plot, together with a Ljung–Box test at lag 10.
+
+These are model diagnostics on the observed sample, rather
+than an independent validation of the specified variances.
+
+```{r forecast-error-diagnostics}
+forecast_errors <- as.numeric(y) - forecast_mean
+standardized_errors <- forecast_errors / forecast_sd
+
+stopifnot(
+  length(standardized_errors) == length(y),
+  all(is.finite(standardized_errors))
+)
+
+ljung_box <- Box.test(
+  standardized_errors,
+  lag = 10,
+  type = "Ljung-Box",
+  fitdf = 0
+)
+
+diagnostic_summary <- data.frame(
+  Diagnostic = c(
+    "Mean standardized error",
+    "SD of standardized errors",
+    "95 percent prediction interval coverage",
+    "Ljung-Box p-value (lag 10)"
+  ),
+  Value = c(
+    mean(standardized_errors),
+    sd(standardized_errors),
+    mean(abs(standardized_errors) <= qnorm(0.975)),
+    ljung_box$p.value
+  )
+)
+```
+
+```{r forecast-error-summary, results='asis'}
+knitr::kable(
+  diagnostic_summary,
+  format = "latex",
+  booktabs = TRUE,
+  digits = 3,
+  row.names = FALSE,
+  caption = "Baseline forecast error diagnostics. Coverage is expressed as a proportion.",
+  position = "H"
+)
+```
+
+```{r forecast-error-plots, fig.width=6.4, fig.height=2.5, out.width="100%", fig.cap="Standardized forecast errors over time (A), their sample autocorrelation (B), and a normal quantile plot (C). Dashed ACF bounds are approximate pointwise 95 percent reference limits."}
+local({
+  old_par <- par(no.readonly = TRUE)
+  on.exit(par(old_par))
+
+  par(
+    mfrow = c(1, 3),
+    mar = c(3.5, 3.5, 3, 0.8),
+    mgp = c(2, 0.6, 0),
+    cex = 0.8
+  )
+
+  plot(
+    nile_data$Year,
+    standardized_errors,
+    type = "l",
+    col = "#243746",
+    xlab = "Year",
+    ylab = "Standardized error",
+    main = "(A)  Forecast errors"
+  )
+  abline(h = 0, col = "grey60", lty = 2)
+
+  acf(
+  standardized_errors,
+  lag.max = 20,
+  main = "",
+  xlab = "Lag",
+  col = "#243746"
+  )
+
+title(main = "(B)  ACF", line = 1)
+
+  qqnorm(
+    standardized_errors,
+    main = "(C)  Normal Q-Q plot",
+    xlab = "Theoretical quantiles",
+    ylab = "Sample quantiles",
+    pch = 16,
+    cex = 0.55,
+    col = "#243746"
+  )
+  qqline(
+    standardized_errors,
+    col = "#B36B35",
+    lwd = 1
+  )
+})
+```
+The standardized errors have mean approximately $-0.044$
+and standard deviation 1.009, close to the model reference
+values of zero and one. The prediction intervals contain
+95 of the 100 observations.
+
+The Ljung–Box test at lag 10 gives a p-value of 0.175,
+so it does not reject the absence of autocorrelation at
+the 5 percent level. The normal quantile plot is broadly
+linear, with some departures in the tails.
+
+These checks reveal no strong overall contradiction of
+the baseline model, but do not establish independence,
+normality, or predictive calibration in other samples.
+
+# Smoothing
+
+Smoothing estimates each past state using all observations,
+including those recorded after that year:
+
+\[
+\theta_t \mid y_{1:T} \sim \mathcal{N}(s_t,S_t).
+\]
+
+Unlike filtering, this is a retrospective reconstruction.
+The additional observations reduce state uncertainty:
+\(S_t \leq C_t\). At the final observation, smoothing and
+filtering coincide because no subsequent data are available.
+
+```{r kalman-smoothing}
+nile_smoother <- dlmSmooth(nile_filter)
+
+smooth_mean <- as.numeric(dropFirst(nile_smoother$s))
+
+smooth_covariances <- dlmSvd2var(
+  nile_smoother$U.S,
+  nile_smoother$D.S
+)
+
+smooth_variance_all <- vapply(
+  smooth_covariances,
+  function(x) as.numeric(x[1, 1]),
+  numeric(1)
+)
+
+smooth_variance <- smooth_variance_all[-1]
+smooth_sd <- sqrt(smooth_variance)
+
+smoothing_data <- filter_data
+smoothing_data$SmoothMean <- smooth_mean
+smoothing_data$SmoothLower <-
+  smooth_mean - qnorm(0.975) * smooth_sd
+smoothing_data$SmoothUpper <-
+  smooth_mean + qnorm(0.975) * smooth_sd
+
+t0 <- 28L
+comparison_year <- nile_data$Year[t0]
+
+stopifnot(
+  length(smooth_mean) == length(y),
+  all(is.finite(smooth_mean)),
+  all(is.finite(smooth_variance)),
+  all(smooth_variance > 0),
+  all(smooth_variance <= filter_variance + 1e-6),
+  isTRUE(all.equal(
+    tail(smooth_mean, 1),
+    tail(filter_mean, 1)
+  )),
+  isTRUE(all.equal(
+    tail(smooth_variance, 1),
+    tail(filter_variance, 1)
+  ))
+)
+```
+
+```{r smoothing-comparison-plot, fig.width=6, fig.height=2.5, out.width="95%", fig.cap="Filtered and smoothed latent levels. The shaded band gives pointwise 95 percent smoothing credible intervals, conditional on the specified parameters. The vertical dotted line marks 1898 (t = 28)."}
+ggplot(smoothing_data, aes(x = Year)) +
+  geom_ribbon(
+    aes(ymin = SmoothLower, ymax = SmoothUpper),
+    fill = "#24476B",
+    alpha = 0.16
+  ) +
+  geom_line(
+    aes(y = Flow, color = "Observed flow"),
+    linewidth = 0.3
+  ) +
+  geom_line(
+    aes(y = Mean, color = "Filtered level"),
+    linewidth = 0.5,
+    linetype = "dashed"
+  ) +
+  geom_line(
+    aes(y = SmoothMean, color = "Smoothed level"),
+    linewidth = 0.6
+  ) +
+  geom_vline(
+    xintercept = comparison_year,
+    linetype = "dotted",
+    color = "grey40",
+    linewidth = 0.35
+  ) +
+  scale_color_manual(
+    values = c(
+      "Observed flow" = "#AAAAAA",
+      "Filtered level" = "#B36B35",
+      "Smoothed level" = "#24476B"
+    ),
+    name = NULL
+  ) +
+  scale_x_continuous(
+    breaks = seq(1880, 1960, 20)
+  ) +
+  labs(
+    x = "Year",
+    y = expression("Annual flow (" * 10^8 * " " * m^3 * ")")
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+The smoothed level incorporates subsequent observations and therefore
+begins to decline earlier than the filtered level around 1898.
+This is a retrospective revision, rather than evidence that the model
+could anticipate the decline in real time.
+
+The following comparison focuses on 1898 ($t = 28$), showing how
+subsequent observations revise the estimated latent level and its
+uncertainty.
+
+```{r state-comparison-1898, fig.width=6, fig.height=2.3, out.width="75%", fig.cap="Filtered and smoothed latent-level estimates for 1898, with pointwise 95 percent credible intervals conditional on the specified parameters."}
+state_comparison <- data.frame(
+  Method = factor(
+    c("Filtered", "Smoothed"),
+    levels = c("Filtered", "Smoothed")
+  ),
+  Estimate = c(filter_mean[t0], smooth_mean[t0]),
+  SD = c(filter_sd[t0], smooth_sd[t0])
+)
+
+state_comparison$Lower <-
+  state_comparison$Estimate - qnorm(0.975) * state_comparison$SD
+state_comparison$Upper <-
+  state_comparison$Estimate + qnorm(0.975) * state_comparison$SD
+
+ggplot(state_comparison, aes(x = Method, y = Estimate, color = Method)) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.12) +
+  geom_point(size = 2.5) +
+  scale_color_manual(
+    values = c("Filtered" = "#B36B35", "Smoothed" = "#24476B")
+  ) +
+  labs(
+    x = NULL,
+    y = expression("Annual flow (" * 10^8 * " m"^3 * ")")
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+```
+For 1898, the filtered level is
+`r sprintf("%.1f", state_comparison$Estimate[1])`,
+with a 95 percent credible interval of
+[`r sprintf("%.1f", state_comparison$Lower[1])`,
+`r sprintf("%.1f", state_comparison$Upper[1])`].
+Using the full series revises the estimate to
+`r sprintf("%.1f", state_comparison$Estimate[2])`,
+with a narrower interval of
+[`r sprintf("%.1f", state_comparison$Lower[2])`,
+`r sprintf("%.1f", state_comparison$Upper[2])`].
+The subsequent low-flow observations pull the retrospective estimate
+downward and reduce uncertainty about the latent level.
+
+# Variance Estimation
+
+We now estimate the observation variance $V$ and state innovation
+variance $W$ by maximum likelihood, keeping the initial distribution
+fixed at $\theta_0 \sim \mathcal{N}(1000,1000)$.
+
+Optimization is performed on the logarithms of the variances to
+ensure positivity. Approximate standard errors are obtained from
+the inverse numerical Hessian and transformed to the variance
+scale using the delta method.
+
+```{r variance-estimation}
+build_nile_model <- function(log_variances) {
+  dlmModPoly(
+    order = 1,
+    dV = exp(log_variances[1]),
+    dW = exp(log_variances[2]),
+    m0 = m0,
+    C0 = C0
+  )
+}
+
+variance_fit <- dlmMLE(
+  y,
+  parm = log(c(V_known, W_known)),
+  build = build_nile_model,
+  method = "BFGS",
+  hessian = TRUE,
+  control = list(maxit = 1000, reltol = 1e-10)
+)
+
+stopifnot(
+  variance_fit$convergence == 0,
+  all(is.finite(variance_fit$par)),
+  all(is.finite(variance_fit$hessian))
+)
+
+information_matrix <- (
+  variance_fit$hessian + t(variance_fit$hessian)
+) / 2
+
+stopifnot(
+  all(eigen(information_matrix, symmetric = TRUE)$values > 0)
+)
+
+log_variance_cov <- solve(information_matrix)
+estimated_variances <- exp(variance_fit$par)
+
+variance_se <- estimated_variances *
+  sqrt(diag(log_variance_cov))
+
+variance_table <- data.frame(
+  Parameter = c("Observation variance V", "State innovation variance W"),
+  Reference = c(V_known, W_known),
+  Estimate = estimated_variances,
+  SE = variance_se
+)
+
+kable(
+  variance_table,
+  format = "latex",
+  booktabs = TRUE,
+  position = "H",
+  digits = 2,
+  row.names = FALSE,
+  col.names = c(
+    "Parameter", "Specified value", "MLE", "Approx. SE"
+  ),
+  caption = "Variance estimates conditional on the specified initial distribution."
+)
+```
+
+The estimated variances are close to the specified values used
+in the filtering and smoothing analysis. These estimates are
+conditional on the fixed initial distribution
+$\theta_0 \sim \mathcal{N}(1000,1000)$; a different initialization
+can produce different maximum-likelihood estimates.
+
+The approximate standard error of $W$ is large relative to its
+estimate, indicating substantial uncertainty about the state
+innovation variance. A symmetric normal confidence interval
+would extend below zero, so the standard error should be
+interpreted cautiously.
+
+The state intervals reported earlier condition on the specified
+variance values and do not incorporate uncertainty about these
+parameters.
+
+# Discussion and Limitations
+
+The local level model separates observed Nile flow into a changing
+latent level and observation noise. Filtering updates the level
+sequentially, while smoothing uses the full series to revise past
+estimates and reduce state uncertainty. The comparison for 1898
+illustrates how subsequent low-flow observations alter the
+retrospective reconstruction.
+
+The signal-to-noise ratio controls responsiveness: larger values
+produce faster adjustments to new observations. Forecast-error
+diagnostics reveal no strong overall contradiction with the model,
+but do not establish its adequacy in other samples.
+
+The analysis assumes Gaussian, mutually independent observation
+and state innovations with constant variances. It does not explicitly
+model abrupt structural changes or their causes. Variance estimates
+and their approximate standard errors depend on this specification
+and the fixed initial distribution. The reported state intervals
+condition on the specified variances and exclude parameter uncertainty.
