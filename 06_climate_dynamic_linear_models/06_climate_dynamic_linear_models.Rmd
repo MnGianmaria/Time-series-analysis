@@ -1,0 +1,1048 @@
+---
+title: "Temperature Anomalies: Filtering, Smoothing and Forecasting"
+author: "Gianmaria Monaco | Bocconi University | Time Series Analysis | Group 32"
+output:
+  pdf_document:
+    number_sections: true
+fontsize: 11pt
+geometry: margin=1in
+documentclass: article
+header-includes:
+  - \usepackage{float}
+  - \usepackage{booktabs}
+  - \usepackage{caption}
+  - \captionsetup[figure]{font=small,labelfont=bf,textfont=it,labelsep=period,justification=raggedright,singlelinecheck=false,skip=6pt}
+  - \captionsetup[table]{font=small,labelfont=bf,textfont=it,labelsep=period,justification=raggedright,singlelinecheck=false,skip=6pt,position=top}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 6,
+  fig.height = 2.5,
+  out.width = "95%",
+  fig.align = "center",
+  fig.pos = "H"
+)
+
+library(ggplot2)
+library(zoo)
+library(dlm)
+library(knitr)
+```
+
+# Introduction
+
+This analysis investigates the evolution of Northern Hemisphere
+temperature anomalies using two Gaussian dynamic linear models:
+a random walk plus noise model and a local linear trend model.
+
+We estimate variance parameters by maximum likelihood and use
+Kalman filtering and smoothing to reconstruct the latent level
+and quantify conditional state uncertainty.
+
+Predictive performance is assessed through sequential one-step-ahead
+forecasts over the final twenty years, with parameters estimated
+on the preceding training sample. The discussion contrasts
+continuous latent-state models with the discrete-state
+representation used by Hidden Markov Models.
+
+# Data and Seasonal Adjustment
+
+The analysis uses monthly Northern Hemisphere temperature anomalies
+from GISTEMP, expressed in degrees Celsius relative to the
+1951–1980 reference period. We retain observations from January
+1880 to December 2024.
+
+For the retrospective analysis, a fixed seasonal component is
+estimated using periodic STL over the selected sample and
+subtracted from the observations. Forecast evaluation will use
+a separate seasonal adjustment estimated on the training sample only.
+
+```{r load-temperature-data}
+data_url <- paste0(
+  "https://raw.githubusercontent.com/",
+  "MnGianmaria/time-series-analysis/main/",
+  "02_temperature_anomalies_and_forecasting/data/gistemp.csv"
+)
+
+gistemp_raw <- read.csv(
+  data_url,
+  skip = 1,
+  na.strings = "***",
+  check.names = FALSE
+)
+
+gistemp_raw <- gistemp_raw[
+  gistemp_raw$Year >= 1880 & gistemp_raw$Year <= 2024,
+]
+
+month_names <- c(
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+)
+
+monthly_matrix <- as.matrix(gistemp_raw[, month_names])
+temperature_values <- as.numeric(t(monthly_matrix))
+
+stopifnot(
+  nrow(gistemp_raw) > 0,
+  gistemp_raw$Year[1] == 1880,
+  tail(gistemp_raw$Year, 1) == 2024,
+  all(diff(gistemp_raw$Year) == 1),
+  all(is.finite(temperature_values))
+)
+
+gistemp_ts <- ts(
+  temperature_values,
+  start = c(1880, 1),
+  frequency = 12
+)
+
+seasonal_fit <- stl(
+  gistemp_ts,
+  s.window = "periodic"
+)
+
+y_sa <- gistemp_ts -
+  seasonal_fit$time.series[, "seasonal"]
+
+climate_data <- data.frame(
+  Date = as.Date(as.yearmon(time(y_sa))),
+  Temperature = as.numeric(y_sa)
+)
+```
+
+The selected sample contains `r length(y_sa)` monthly observations.
+Because GISTEMP anomalies already use calendar-month reference
+means, STL removes only a residual seasonal pattern; it does
+not remove the long-term warming movement.
+
+```{r adjusted-temperature-plot, fig.width=6, fig.height=2, out.width="95%", fig.cap="Seasonally adjusted Northern Hemisphere temperature anomalies, 1880–2024. Periodic STL is applied to the full selected sample for retrospective analysis."}
+ggplot(climate_data, aes(x = Date, y = Temperature)) +
+  geom_hline(
+    yintercept = 0,
+    color = "grey70",
+    linewidth = 0.3
+  ) +
+  geom_line(
+    color = "#243746",
+    linewidth = 0.35
+  ) +
+  scale_x_date(
+    breaks = as.Date(paste0(seq(1880, 2020, 20), "-01-01")),
+    date_labels = "%Y"
+  ) +
+  labs(
+    x = "Year",
+    y = "Temperature anomaly (°C)"
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "#E8E8E8",
+      linewidth = 0.2
+    ),
+    panel.border = element_rect(
+      color = "#888888",
+      linewidth = 0.3
+    )
+  )
+```
+
+The series displays substantial short-term fluctuations alongside
+a sustained rise in recent decades. We therefore consider models
+with an evolving latent level, rather than a constant mean.
+
+# Model Specification
+
+We compare two Gaussian dynamic linear models. Unlike an HMM,
+whose latent state takes values in a finite set, these models
+use a continuous latent state. Changes are represented through
+state innovations rather than transitions between discrete regimes.
+
+The random walk plus noise model (RW) specifies an evolving level:
+
+\[
+\begin{aligned}
+y_t &= \mu_t + \varepsilon_t,
+& \varepsilon_t &\sim \mathcal{N}(0,\sigma^2),\\
+\mu_t &= \mu_{t-1} + \eta_t,
+& \eta_t &\sim \mathcal{N}(0,\tau^2).
+\end{aligned}
+\]
+
+The local linear trend model (LLT) adds an evolving slope:
+
+\[
+\begin{aligned}
+y_t &= \mu_t + \varepsilon_t,
+& \varepsilon_t &\sim \mathcal{N}(0,\sigma^2),\\
+\mu_t &= \mu_{t-1} + \beta_{t-1} + \eta_t,
+& \eta_t &\sim \mathcal{N}(0,\tau^2),\\
+\beta_t &= \beta_{t-1} + \zeta_t,
+& \zeta_t &\sim \mathcal{N}(0,\gamma^2).
+\end{aligned}
+\]
+
+Here, \(\mu_t\) is the latent temperature-anomaly level and
+\(\beta_t\) is the local slope, expressed in degrees Celsius
+per month. Observation errors and state
+innovations are mutually independent, independent over time,
+and independent of the initial state.
+
+Both models allow stochastic changes in the level. The LLT
+additionally allows the slope to change, although a slope
+innovation variance near zero would imply an approximately
+constant slope, rather than necessarily a zero slope.
+
+We use Gaussian initial distributions with zero means and
+covariance \(10^7 I\), providing a diffuse approximation.
+Variance parameters are estimated by maximum likelihood.
+Filtering and smoothing intervals then condition on these
+estimates and do not incorporate parameter uncertainty.
+
+# Variance Estimation
+
+Variance parameters are estimated by maximum likelihood on the
+full seasonally adjusted sample for retrospective analysis.
+Optimization uses logarithmic parameters to ensure positivity.
+
+Approximate standard errors are calculated from the numerical
+Hessian using the delta method. If the Hessian is not sufficiently
+well conditioned, standard errors are left unavailable rather
+than reported as reliable estimates.
+
+```{r variance-estimation}
+build_rw <- function(log_variances) {
+  dlmModPoly(
+    order = 1,
+    dV = exp(log_variances[1]),
+    dW = exp(log_variances[2]),
+    m0 = 0,
+    C0 = matrix(1e7, 1, 1)
+  )
+}
+
+build_llt <- function(log_variances) {
+  dlmModPoly(
+    order = 2,
+    dV = exp(log_variances[1]),
+    dW = exp(log_variances[2:3]),
+    m0 = c(0, 0),
+    C0 = diag(1e7, 2)
+  )
+}
+
+sample_variance <- var(as.numeric(y_sa))
+
+fit_rw <- dlmMLE(
+  y_sa,
+  parm = log(c(sample_variance, sample_variance / 10)),
+  build = build_rw,
+  method = "BFGS",
+  hessian = TRUE,
+  control = list(maxit = 2000, reltol = 1e-10)
+)
+
+fit_llt <- dlmMLE(
+  y_sa,
+  parm = log(c(
+    sample_variance,
+    sample_variance / 10,
+    sample_variance / 100
+  )),
+  build = build_llt,
+  method = "BFGS",
+  hessian = TRUE,
+  control = list(maxit = 2000, reltol = 1e-10)
+)
+
+stopifnot(
+  fit_rw$convergence == 0,
+  fit_llt$convergence == 0,
+  all(is.finite(fit_rw$par)),
+  all(is.finite(fit_llt$par))
+)
+
+mod_rw <- build_rw(fit_rw$par)
+mod_llt <- build_llt(fit_llt$par)
+
+variance_standard_errors <- function(fit) {
+  estimates <- exp(fit$par)
+  unavailable <- rep(NA_real_, length(estimates))
+
+  H <- (fit$hessian + t(fit$hessian)) / 2
+
+  if (any(!is.finite(H))) {
+    return(unavailable)
+  }
+
+  eigenvalues <- eigen(H, symmetric = TRUE)$values
+
+  if (min(eigenvalues) <= 1e-8 * max(abs(eigenvalues))) {
+    return(unavailable)
+  }
+
+  log_covariance <- solve(H)
+
+  estimates * sqrt(diag(log_covariance))
+}
+
+rw_estimates <- exp(fit_rw$par)
+llt_estimates <- exp(fit_llt$par)
+
+variance_results <- data.frame(
+  Model = c("RW", "RW", "LLT", "LLT", "LLT"),
+  Parameter = c(
+    "Observation variance",
+    "Level innovation variance",
+    "Observation variance",
+    "Level innovation variance",
+    "Slope innovation variance"
+  ),
+  Estimate = c(rw_estimates, llt_estimates),
+  SE = c(
+    variance_standard_errors(fit_rw),
+    variance_standard_errors(fit_llt)
+  )
+)
+```
+
+```{r variance-estimation-table, results='asis'}
+variance_display <- variance_results
+
+variance_display$Estimate <- formatC(
+  variance_results$Estimate,
+  format = "e",
+  digits = 3
+)
+
+variance_display$SE <- ifelse(
+  is.na(variance_results$SE),
+  "Unavailable",
+  formatC(variance_results$SE, format = "e", digits = 3)
+)
+
+slope_row <- which(
+  variance_results$Model == "LLT" &
+    variance_results$Parameter == "Slope innovation variance"
+)
+
+slope_near_boundary <-
+  llt_estimates[3] / llt_estimates[1] < 1e-6
+
+if (slope_near_boundary) {
+  variance_display$Estimate[slope_row] <- "Near zero"
+  variance_display$SE[slope_row] <- "Not reported"
+}
+
+kable(
+  variance_display,
+  format = "latex",
+  booktabs = TRUE,
+  position = "H",
+  row.names = FALSE,
+  col.names = c("Model", "Parameter", "Estimate", "Approx. SE"),
+  caption = "Full-sample variance estimates. The slope-variance standard error is omitted when its estimate is numerically near the boundary."
+)
+```
+
+The estimated observation variance is approximately 0.0206
+in both models, while the level innovation variance is
+approximately 0.0062.
+
+The LLT slope innovation variance is numerically near zero,
+indicating little estimated variation in the slope. This does
+not imply that the slope itself is zero or establish equivalence
+with the RW model. Its approximate standard error is not
+reported because the near-boundary estimate makes the
+Hessian-based normal approximation unreliable.
+
+# Filtering and Smoothing
+
+For each model, the Kalman filter estimates the latent level
+using observations up to the corresponding month. Variance
+parameters and seasonal adjustment are estimated on the full
+sample, so this is a retrospective analysis rather than a
+real-time evaluation.
+
+The shaded bands represent pointwise 95 percent conditional
+credible intervals for the latent level, rather than prediction
+intervals for observed temperatures.
+
+```{r kalman-filtering}
+kfilt_rw <- dlmFilter(y_sa, mod_rw)
+kfilt_llt <- dlmFilter(y_sa, mod_llt)
+
+extract_level <- function(state_mean, U, D, model_name) {
+  means <- as.matrix(state_mean)[-1, 1]
+
+  covariances <- dlmSvd2var(U, D)
+  variances <- vapply(
+    covariances[-1],
+    function(x) as.numeric(x[1, 1]),
+    numeric(1)
+  )
+
+  stopifnot(
+    length(means) == length(y_sa),
+    length(variances) == length(y_sa),
+    all(is.finite(means)),
+    all(is.finite(variances)),
+    all(variances >= 0)
+  )
+
+  data.frame(
+    Date = climate_data$Date,
+    Observed = as.numeric(y_sa),
+    Mean = means,
+    Variance = variances,
+    Lower = means - qnorm(0.975) * sqrt(variances),
+    Upper = means + qnorm(0.975) * sqrt(variances),
+    Model = model_name
+  )
+}
+
+filter_rw <- extract_level(
+  kfilt_rw$m,
+  kfilt_rw$U.C,
+  kfilt_rw$D.C,
+  "RW"
+)
+
+filter_llt <- extract_level(
+  kfilt_llt$m,
+  kfilt_llt$U.C,
+  kfilt_llt$D.C,
+  "LLT"
+)
+
+filtering_data <- rbind(filter_rw, filter_llt)
+
+filtering_data$Model <- factor(
+  filtering_data$Model,
+  levels = c("RW", "LLT")
+)
+```
+
+```{r filtered-levels-plot, fig.width=6, fig.height=3, out.width="95%", fig.cap="Filtered latent levels under the RW and LLT models. Grey lines show seasonally adjusted observations; blue lines and shaded bands show filtered means and pointwise 95 percent conditional state intervals. Both panels use the same axes."}
+ggplot(filtering_data, aes(x = Date)) +
+  geom_ribbon(
+    aes(ymin = Lower, ymax = Upper),
+    fill = "#24476B",
+    alpha = 0.18
+  ) +
+  geom_line(
+    aes(y = Observed),
+    color = "#AAAAAA",
+    linewidth = 0.25
+  ) +
+  geom_line(
+    aes(y = Mean),
+    color = "#24476B",
+    linewidth = 0.4
+  ) +
+  facet_wrap(~Model, ncol = 1) +
+  scale_x_date(
+    breaks = as.Date(paste0(seq(1880, 2020, 20), "-01-01")),
+    date_labels = "%Y"
+  ) +
+  labs(
+    x = "Year",
+    y = "Temperature anomaly (°C)"
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    strip.background = element_rect(
+      fill = "#F2F2F2",
+      color = NA
+    ),
+    strip.text = element_text(size = 9),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "#E8E8E8",
+      linewidth = 0.2
+    ),
+    panel.spacing = grid::unit(0.8, "lines")
+  )
+```
+
+Both models track the rise in temperature anomalies in recent
+decades while attenuating short-term fluctuations. Their
+filtered level estimates and conditional intervals appear
+very similar at this plotting scale.
+
+This similarity concerns the estimated levels within the
+observed sample; it does not establish equivalence between
+the models or equal predictive performance.
+
+Smoothing reconstructs the latent level using the entire observed
+series, including observations recorded after each month.
+We compare the resulting conditional intervals with those
+obtained by filtering.
+
+```{r kalman-smoothing}
+ksmooth_rw <- dlmSmooth(kfilt_rw)
+ksmooth_llt <- dlmSmooth(kfilt_llt)
+
+smooth_rw <- extract_level(
+  ksmooth_rw$s,
+  ksmooth_rw$U.S,
+  ksmooth_rw$D.S,
+  "RW"
+)
+
+smooth_llt <- extract_level(
+  ksmooth_llt$s,
+  ksmooth_llt$U.S,
+  ksmooth_llt$D.S,
+  "LLT"
+)
+
+smoothing_data <- rbind(smooth_rw, smooth_llt)
+
+smoothing_data$Model <- factor(
+  smoothing_data$Model,
+  levels = c("RW", "LLT")
+)
+
+stopifnot(
+  all(smooth_rw$Variance <= filter_rw$Variance + 1e-6),
+  all(smooth_llt$Variance <= filter_llt$Variance + 1e-6),
+  isTRUE(all.equal(
+    tail(smooth_rw$Mean, 1),
+    tail(filter_rw$Mean, 1)
+  )),
+  isTRUE(all.equal(
+    tail(smooth_llt$Mean, 1),
+    tail(filter_llt$Mean, 1)
+  ))
+)
+
+interval_widths <- data.frame(
+  Model = c("RW", "LLT"),
+  Filtering = c(
+    mean(filter_rw$Upper - filter_rw$Lower),
+    mean(filter_llt$Upper - filter_llt$Lower)
+  ),
+  Smoothing = c(
+    mean(smooth_rw$Upper - smooth_rw$Lower),
+    mean(smooth_llt$Upper - smooth_llt$Lower)
+  )
+)
+```
+```{r initial-state-smoothing}
+initial_state_summary <- function(smoothed, model_name) {
+  initial_mean <- as.matrix(smoothed$s)[1, 1]
+  initial_cov <- dlmSvd2var(
+    smoothed$U.S,
+    smoothed$D.S
+  )[[1]]
+
+  initial_sd <- sqrt(initial_cov[1, 1])
+
+  data.frame(
+    Model = model_name,
+    Mean = initial_mean,
+    Lower = initial_mean - qnorm(0.975) * initial_sd,
+    Upper = initial_mean + qnorm(0.975) * initial_sd
+  )
+}
+
+initial_smoothing <- rbind(
+  initial_state_summary(ksmooth_rw, "RW"),
+  initial_state_summary(ksmooth_llt, "LLT")
+)
+
+kable(
+  initial_smoothing,
+  format = "latex",
+  booktabs = TRUE,
+  position = "H",
+  digits = 3,
+  row.names = FALSE,
+  col.names = c("Model", "Mean", "Lower", "Upper"),
+  caption = "Smoothed initial level at t = 0: conditional means and 95 percent credible intervals, in degrees Celsius."
+)
+```
+
+The initial level at \(t=0\), immediately preceding the first
+observation, is estimated using the full sample through smoothing.
+The figures and mean interval widths below refer to the observed
+months, \(t=1,\ldots,T\).
+
+```{r smoothed-levels-plot, fig.width=6, fig.height=3, out.width="95%", fig.cap="Smoothed latent levels under the RW and LLT models. Grey lines show seasonally adjusted observations; blue lines and shaded bands show smoothed means and pointwise 95 percent conditional state intervals. Both panels use the same axes."}
+ggplot(smoothing_data, aes(x = Date)) +
+  geom_ribbon(
+    aes(ymin = Lower, ymax = Upper),
+    fill = "#24476B",
+    alpha = 0.18
+  ) +
+  geom_line(
+    aes(y = Observed),
+    color = "#AAAAAA",
+    linewidth = 0.25
+  ) +
+  geom_line(
+    aes(y = Mean),
+    color = "#24476B",
+    linewidth = 0.4
+  ) +
+  facet_wrap(~Model, ncol = 1) +
+  scale_x_date(
+    breaks = as.Date(paste0(seq(1880, 2020, 20), "-01-01")),
+    date_labels = "%Y"
+  ) +
+  labs(
+    x = "Year",
+    y = "Temperature anomaly (°C)"
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    strip.background = element_rect(
+      fill = "#F2F2F2",
+      color = NA
+    ),
+    strip.text = element_text(size = 9),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "#E8E8E8",
+      linewidth = 0.2
+    ),
+    panel.spacing = grid::unit(0.8, "lines")
+  )
+```
+
+```{r interval-width-table, results='asis'}
+kable(
+  interval_widths,
+  format = "latex",
+  booktabs = TRUE,
+  position = "H",
+  digits = 3,
+  row.names = FALSE,
+  col.names = c(
+    "Model",
+    "Mean filtering width",
+    "Mean smoothing width"
+  ),
+  caption = "Mean width of pointwise 95 percent conditional state intervals, in degrees Celsius."
+)
+```
+
+The RW and LLT smoothed levels appear very similar at this
+plotting scale. Both reconstruct the sustained rise in
+temperature anomalies in recent decades while attenuating
+short-term fluctuations.
+
+The mean interval width decreases from approximately 0.364 °C
+to 0.290 °C for RW and from 0.366 °C to 0.290 °C for LLT.
+This reduction reflects the additional information provided
+by subsequent observations. At the final observation,
+filtering and smoothing coincide.
+
+These are pointwise intervals for the latent level, conditional
+on the estimated parameters and seasonal adjustment. They
+exclude parameter uncertainty and do not establish real-time
+forecasting performance.
+
+# One-Step-Ahead Forecast Evaluation
+
+The final twenty years, January 2005–December 2024, are reserved
+for testing. Earlier observations form the training sample.
+
+Periodic STL is fitted to the training sample only. Its estimated
+monthly seasonal effects are held fixed and subtracted from
+both training and test observations. This avoids using test
+observations to estimate the seasonal adjustment.
+
+Both DLMs are then re-estimated on the adjusted training sample.
+Their variance parameters remain fixed during testing, while
+the state is updated after each new observation. The evaluation
+therefore concerns sequential one-month-ahead forecasts,
+rather than a twenty-year extrapolation from 2004.
+
+```{r forecast-data-preparation}
+temperature_train <- window(
+  gistemp_ts,
+  end = c(2004, 12)
+)
+
+temperature_test <- window(
+  gistemp_ts,
+  start = c(2005, 1)
+)
+
+training_stl <- stl(
+  temperature_train,
+  s.window = "periodic"
+)
+
+seasonal_by_month <- tapply(
+  as.numeric(training_stl$time.series[, "seasonal"]),
+  cycle(temperature_train),
+  mean
+)
+
+adjusted_train <- ts(
+  as.numeric(temperature_train) -
+    seasonal_by_month[as.character(cycle(temperature_train))],
+  start = start(temperature_train),
+  frequency = 12
+)
+
+adjusted_test <- ts(
+  as.numeric(temperature_test) -
+    seasonal_by_month[as.character(cycle(temperature_test))],
+  start = start(temperature_test),
+  frequency = 12
+)
+
+stopifnot(
+  length(adjusted_test) == 20 * 12,
+  length(adjusted_train) + length(adjusted_test) ==
+    length(gistemp_ts),
+  all(is.finite(adjusted_train)),
+  all(is.finite(adjusted_test))
+)
+```
+
+The training sample contains `r length(adjusted_train)` monthly
+observations and the test sample contains `r length(adjusted_test)`.
+The seasonal effects used here may differ from those estimated
+over the full sample for the retrospective analysis.
+
+```{r training-model-estimation}
+training_variance <- var(as.numeric(adjusted_train))
+
+fit_rw_train <- dlmMLE(
+  adjusted_train,
+  parm = log(c(
+    training_variance,
+    training_variance / 10
+  )),
+  build = build_rw,
+  method = "BFGS",
+  control = list(maxit = 2000, reltol = 1e-10)
+)
+
+fit_llt_train <- dlmMLE(
+  adjusted_train,
+  parm = log(c(
+    training_variance,
+    training_variance / 10,
+    training_variance / 100
+  )),
+  build = build_llt,
+  method = "BFGS",
+  control = list(maxit = 2000, reltol = 1e-10)
+)
+
+stopifnot(
+  fit_rw_train$convergence == 0,
+  fit_llt_train$convergence == 0,
+  all(is.finite(fit_rw_train$par)),
+  all(is.finite(fit_llt_train$par))
+)
+
+mod_rw_train <- build_rw(fit_rw_train$par)
+mod_llt_train <- build_llt(fit_llt_train$par)
+```
+
+```{r sequential-test-forecasts}
+evaluation_series <- ts(
+  c(as.numeric(adjusted_train), as.numeric(adjusted_test)),
+  start = start(adjusted_train),
+  frequency = 12
+)
+
+evaluation_filter_rw <- dlmFilter(
+  evaluation_series,
+  mod_rw_train
+)
+
+evaluation_filter_llt <- dlmFilter(
+  evaluation_series,
+  mod_llt_train
+)
+
+n_train <- length(adjusted_train)
+n_test <- length(adjusted_test)
+test_indices <- n_train + seq_len(n_test)
+
+pred_rw <- as.numeric(evaluation_filter_rw$f)[test_indices]
+pred_llt <- as.numeric(evaluation_filter_llt$f)[test_indices]
+
+err_rw <- as.numeric(adjusted_test) - pred_rw
+err_llt <- as.numeric(adjusted_test) - pred_llt
+
+stopifnot(
+  length(pred_rw) == n_test,
+  length(pred_llt) == n_test,
+  all(is.finite(err_rw)),
+  all(is.finite(err_llt))
+)
+
+forecast_data <- data.frame(
+  Date = as.Date(as.yearmon(time(adjusted_test))),
+  Observed = as.numeric(adjusted_test),
+  RW = pred_rw,
+  LLT = pred_llt
+)
+
+rmse_results <- data.frame(
+  Model = c("RW", "LLT"),
+  RMSE = c(
+    sqrt(mean(err_rw^2)),
+    sqrt(mean(err_llt^2))
+  )
+)
+```
+
+```{r test-forecast-plot, fig.width=6, fig.height=3, out.width="95%", fig.cap="Sequential one-step-ahead forecasts over 2005–2024. Observations are adjusted using seasonal effects estimated on the training sample. Model parameters remain fixed, while states are updated after each observation."}
+ggplot(forecast_data, aes(x = Date)) +
+  geom_line(
+    aes(y = Observed, color = "Observed"),
+    linewidth = 0.35
+  ) +
+  geom_line(
+    aes(y = RW, color = "RW"),
+    linewidth = 0.5
+  ) +
+  geom_line(
+    aes(y = LLT, color = "LLT"),
+    linewidth = 0.5,
+    linetype = "dashed"
+  ) +
+  scale_color_manual(
+    values = c(
+      "Observed" = "#AAAAAA",
+      "RW" = "#24476B",
+      "LLT" = "#B36B35"
+    ),
+    breaks = c("Observed", "RW", "LLT"),
+    name = NULL
+  ) +
+  scale_x_date(
+    breaks = as.Date(c(
+      "2005-01-01", "2010-01-01",
+      "2015-01-01", "2020-01-01", "2025-01-01"
+    )),
+    date_labels = "%Y"
+  ) +
+  labs(
+    x = "Year",
+    y = "Temperature anomaly (°C)"
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "#E8E8E8",
+      linewidth = 0.2
+    )
+  )
+```
+
+Forecast accuracy is summarized by the root mean squared error:
+
+\[
+\mathrm{RMSE}
+=
+\sqrt{\frac{1}{n_{\mathrm{test}}}
+\sum_{t \in \mathrm{test}}(y_t-\hat{y}_{t|t-1})^2}.
+\]
+
+Errors are calculated on the seasonally adjusted scale.
+Adding the same fixed monthly seasonal effects back to forecasts
+and observations leaves these errors unchanged.
+
+```{r test-rmse-table, results='asis'}
+kable(
+  rmse_results,
+  format = "latex",
+  booktabs = TRUE,
+  position = "H",
+  digits = 4,
+  row.names = FALSE,
+  caption = "Test-sample RMSE for sequential one-step-ahead forecasts, in degrees Celsius."
+)
+```
+The two models produce very similar sequential forecasts,
+following the broad increase in temperature anomalies while
+missing some sharp monthly fluctuations.
+
+Test RMSE is `r sprintf("%.4f", rmse_results$RMSE[1])` °C
+for RW and `r sprintf("%.4f", rmse_results$RMSE[2])` °C
+for LLT. The LLT has a slightly lower error on this sample,
+but the difference is small and has not been assessed for
+statistical significance.
+
+These results concern one-month-ahead prediction with sequential
+state updates; they do not establish long-horizon forecasting
+accuracy.
+
+We examine test forecast errors using autocorrelation functions,
+normal Q-Q plots, and a Ljung–Box test at lag 10. ACF bands
+provide approximate pointwise reference limits; the Ljung–Box
+test assesses the first ten autocorrelations jointly.
+
+```{r test-error-summary, include=FALSE}
+summarize_errors <- function(errors) {
+  correlations <- as.numeric(
+    acf(errors, lag.max = 40, plot = FALSE)$acf
+  )[-1]
+
+  reference_bound <- qnorm(0.975) / sqrt(length(errors))
+
+  c(
+    Lag1 = correlations[1],
+    Outside = sum(abs(correlations) > reference_bound),
+    LjungBoxP = Box.test(
+      errors,
+      lag = 10,
+      type = "Ljung-Box",
+      fitdf = 0
+    )$p.value
+  )
+}
+
+error_diagnostics <- rbind(
+  RW = summarize_errors(err_rw),
+  LLT = summarize_errors(err_llt)
+)
+```
+```{r test-error-diagnostics, fig.width=6.4, fig.height=3.3, out.width="100%", fig.cap="Test forecast error diagnostics for RW and LLT. The upper panels show sample autocorrelations, with lags measured in months and approximate pointwise 95 percent reference bounds. The lower panels show normal Q-Q plots of errors in degrees Celsius."}
+local({
+  old_par <- par(no.readonly = TRUE)
+  on.exit(par(old_par))
+
+  par(
+    mfrow = c(2, 2),
+    mar = c(3.5, 3.8, 2.5, 1),
+    mgp = c(2.2, 0.7, 0),
+    cex = 0.8
+  )
+
+  acf(
+    err_rw,
+    lag.max = 40,
+    main = "",
+    xlab = "Lag (months)",
+    ylab = "ACF",
+    col = "#24476B"
+  )
+  title(main = "A  RW: ACF", line = 1)
+
+  acf(
+    err_llt,
+    lag.max = 40,
+    main = "",
+    xlab = "Lag (months)",
+    ylab = "ACF",
+    col = "#24476B"
+  )
+  title(main = "B  LLT: ACF", line = 1)
+
+  qqnorm(
+    err_rw,
+    main = "",
+    xlab = "Theoretical quantiles",
+    ylab = "Sample quantiles (°C)",
+    pch = 16,
+    cex = 0.55,
+    col = "#24476B"
+  )
+  qqline(err_rw, col = "#B36B35", lwd = 1)
+  title(main = "C  RW: Normal Q-Q", line = 1)
+
+  qqnorm(
+    err_llt,
+    main = "",
+    xlab = "Theoretical quantiles",
+    ylab = "Sample quantiles (°C)",
+    pch = 16,
+    cex = 0.55,
+    col = "#24476B"
+  )
+  qqline(err_llt, col = "#B36B35", lwd = 1)
+  title(main = "D  LLT: Normal Q-Q", line = 1)
+})
+```
+Both models leave substantial serial dependence in their
+forecast errors. Lag-one autocorrelation is approximately
+0.24 for each model. Among the first forty lags, 21 exceed
+the pointwise reference bounds for RW and 20 for LLT.
+The Ljung–Box test at lag 10 gives p-values below \(10^{-6}\)
+for both models, providing strong evidence against the
+absence of autocorrelation over these lags.
+
+The normal Q-Q plots are broadly consistent with a Gaussian
+distribution, without pronounced departures from the reference
+lines. This visual assessment does not establish normality
+or independence.
+
+The LLT does not materially improve these diagnostics relative
+to the RW model.
+
+# Discussion and Limitations
+
+The RW and LLT models represent temperature anomalies through
+a continuous-valued latent level. Both track the sustained
+increase in recent decades and produce very similar filtered
+and smoothed estimates. Smoothing reduces conditional state
+uncertainty by incorporating subsequent observations.
+
+The full-sample LLT slope innovation variance is numerically
+near zero, suggesting an approximately constant slope within
+this fitted specification. This does not imply a zero slope
+or exact equivalence with RW. Test RMSE values are practically
+identical, so RW provides a more parsimonious representation
+with comparable sequential one-step-ahead accuracy.
+
+For representing gradual long-term movements, the evolving
+levels and slopes of DLMs offer a more direct description
+than a level-based HMM, which approximates such movements
+through switches between discrete states. HMMs instead offer
+an interpretable classification into a small number of fitted
+states, although frequent switches can weaken their
+interpretation as persistent regimes. These are differences
+in representation; no predictive comparison with HMMs is
+performed here, and neither approach identifies physical
+climate mechanisms.
+
+Both frameworks use a latent Markov process and assume
+conditionally independent observations given the state
+sequence. Parameters are estimated by maximum likelihood,
+and recursive filtering and smoothing provide latent-state
+distributions. HMM forward-backward smoothing and Kalman
+smoothing use the full sample to obtain marginal distributions.
+Viterbi decoding instead selects a single most likely
+discrete state sequence.
+
+The test errors retain substantial serial dependence:
+lag-one autocorrelation is approximately 0.24 for both models,
+and Ljung–Box tests at lag 10 give p-values below \(10^{-6}\).
+The LLT does not resolve this limitation. Normal Q-Q plots
+are broadly consistent with Gaussian errors, but this does
+not establish independence or validate the full specification.
+
+State intervals condition on estimated parameters and seasonal
+adjustment, excluding their uncertainty. The near-boundary
+slope variance also makes its Hessian-based standard error
+unreliable, so that standard error is not reported.
+
+Finally, evaluation uses one chronological split and a fixed
+seasonal pattern estimated on the training sample. The results
+concern sequential one-month-ahead forecasts using revised
+historical data; they do not establish long-horizon accuracy
+or performance with data available in real time.
