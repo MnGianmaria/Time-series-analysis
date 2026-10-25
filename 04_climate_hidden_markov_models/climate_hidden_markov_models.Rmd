@@ -1,0 +1,1323 @@
+---
+title: "Latent States in Northern Hemisphere Temperature Anomalies"
+author: "Gianmaria Monaco | Bocconi University | Time Series Analysis | Group 32"
+output:
+  pdf_document:
+    number_sections: true
+fontsize: 11pt
+geometry: margin=1in
+documentclass: article
+header-includes:
+  - \usepackage{float}
+  - \usepackage{booktabs}
+  - \usepackage{caption}
+  - \captionsetup[figure]{font=small,labelfont=bf,textfont=it,labelsep=period,justification=raggedright,singlelinecheck=false,skip=6pt}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 6,
+  fig.height = 2.6,
+  out.width = "95%",
+  fig.align = "center",
+  fig.pos = "H"
+)
+
+library(ggplot2)
+library(zoo)
+library(depmixS4)
+library(knitr)
+
+set.seed(123)
+```
+```{r multiple-start-function, include=FALSE}
+fit_multiple_starts <- function(response, data, k, seeds) {
+  best_fit <- NULL
+  best_loglik <- -Inf
+
+  attempts <- data.frame(
+    Seed = seeds,
+    LogLik = NA_real_,
+    Status = NA_character_
+  )
+
+  for (i in seq_along(seeds)) {
+    set.seed(seeds[i])
+
+    current_fit <- tryCatch({
+      model <- depmix(
+        response,
+        data = data,
+        nstates = k,
+        family = gaussian()
+      )
+
+      fit(
+        model,
+        verbose = FALSE,
+        emcontrol = em.control(
+          maxit = 2000,
+          tol = 1e-8,
+          random.start = TRUE
+        )
+      )
+    }, error = function(e) e)
+
+    if (inherits(current_fit, "error")) {
+      attempts$Status[i] <- conditionMessage(current_fit)
+      next
+    }
+
+    current_loglik <- as.numeric(logLik(current_fit))
+
+    attempts$LogLik[i] <- current_loglik
+    attempts$Status[i] <- paste(
+      current_fit@message,
+      collapse = " "
+    )
+
+    if (is.finite(current_loglik) &&
+        current_loglik > best_loglik) {
+      best_fit <- current_fit
+      best_loglik <- current_loglik
+    }
+  }
+
+  if (is.null(best_fit)) {
+    stop("No finite fit obtained for k = ", k)
+  }
+
+  best_status <- paste(best_fit@message, collapse = " ")
+
+  if (!grepl(
+    "Log likelihood converged to within tol.",
+    best_status,
+    fixed = TRUE
+  )) {
+    stop(
+      "The highest-likelihood fit for k = ", k,
+      " requires a convergence check: ", best_status
+    )
+  }
+
+  list(
+    model = best_fit,
+    attempts = attempts
+  )
+}
+```
+
+# Introduction
+
+This analysis investigates whether Gaussian Hidden Markov Models
+provide a useful description of Northern Hemisphere temperature
+anomalies.
+
+We first estimate models with state-dependent mean levels, both
+over the full sample and using observations up to 1975. We then
+introduce state-dependent linear trends and compare the resulting
+specifications using information criteria and decoded state sequences.
+
+The states are interpreted as statistical summaries of the observed
+series, rather than independently established physical climate regimes.
+
+# Data and Seasonal Adjustment
+
+The analysis uses monthly Northern Hemisphere temperature anomalies
+from GISTEMP, expressed in degrees Celsius relative to calendar-month
+means over the 1951–1980 reference period.
+
+We extract the January–December observations and remove a fixed
+seasonal component using STL with a periodic seasonal window.
+Seasonal adjustment is estimated over the full sample for this
+retrospective analysis and re-estimated separately for the sample
+ending in 1975.
+
+Since GISTEMP already reports anomalies relative to monthly reference
+means, STL removes only residual seasonality. The adjusted series
+retains the long-term movement and irregular fluctuations.
+
+```{r load-data}
+data_url <- paste0(
+  "https://raw.githubusercontent.com/",
+  "MnGianmaria/time-series-analysis/main/",
+  "02_temperature_anomalies_and_forecasting/",
+  "data/gistemp.csv"
+)
+
+gistemp_raw <- read.csv(
+  data_url,
+  skip = 1,
+  na.strings = "***"
+)
+
+month_columns <- c(
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+)
+
+stopifnot(
+  all(month_columns %in% names(gistemp_raw)),
+  all(diff(gistemp_raw$Year) == 1)
+)
+
+monthly_matrix <- as.matrix(gistemp_raw[, month_columns])
+temperature_values <- as.numeric(t(monthly_matrix))
+
+stopifnot(all(is.finite(temperature_values)))
+
+gistemp_ts <- ts(
+  temperature_values,
+  start = c(gistemp_raw$Year[1], 1),
+  frequency = 12
+)
+
+seasonal_fit <- stl(
+  gistemp_ts,
+  s.window = "periodic"
+)
+
+temperature_adjusted <- gistemp_ts -
+  seasonal_fit$time.series[, "seasonal"]
+
+climate_data <- data.frame(
+  Date = as.Date(as.yearmon(time(gistemp_ts))),
+  Time = as.numeric(time(gistemp_ts)),
+  Temperature = as.numeric(temperature_adjusted)
+)
+```
+
+The sample contains `r nrow(climate_data)` monthly observations,
+from `r format(min(climate_data$Date), "%B %Y")` to
+`r format(max(climate_data$Date), "%B %Y")`.
+The estimated seasonal component ranges from
+`r sprintf("%.3f", min(seasonal_fit$time.series[, "seasonal"]))`
+to `r sprintf("%.3f", max(seasonal_fit$time.series[, "seasonal"]))`
+°C.
+
+```{r adjusted-temperature-plot, fig.width=5.5, fig.height=2.1, out.width="80%", fig.cap="Seasonally adjusted Northern Hemisphere temperature anomalies. The fixed seasonal component is estimated using periodic STL."}
+ggplot(climate_data, aes(x = Date, y = Temperature)) +
+  geom_hline(
+    yintercept = 0,
+    color = "grey70",
+    linewidth = 0.3
+  ) +
+  geom_line(
+    color = "#243746",
+    linewidth = 0.35
+  ) +
+  scale_x_date(
+  breaks = as.Date(paste0(seq(1880, 2020, 20), "-01-01")),
+  date_labels = "%Y"
+  ) +
+  labs(
+    x = "Year",
+    y = "Temperature anomaly (°C)"
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "#E8E8E8",
+      linewidth = 0.2
+    ),
+    panel.border = element_rect(
+      color = "#888888",
+      linewidth = 0.3
+    )
+  )
+```
+
+# State-Dependent Level Model
+
+The adjusted series exhibits persistent changes in level.
+An HMM provides a way to summarize these patterns through
+latent states without fixing transition dates in advance.
+Estimated transition probabilities describe persistence and
+movement between states. This motivates its use as a
+descriptive model, without assuming that the states correspond
+to distinct physical climate regimes.
+
+We specify a Gaussian Hidden Markov Model:
+
+\[
+Y_t \mid S_t=j \sim \mathcal{N}(\mu_j,\sigma_j^2),
+\]
+
+where \(Y_t\) is the seasonally adjusted temperature anomaly and
+\(S_t\) follows a first-order Markov chain with constant transition
+probabilities. Observations are assumed conditionally independent
+given the state sequence.
+
+Each state has its own mean and standard deviation. We estimate
+models with two to five states using the EM algorithm and compare
+their AIC and BIC. The model with the lowest BIC is retained within
+this candidate set.
+
+Each candidate model is estimated from 25 reproducible random
+initializations. We retain the fit with the highest finite
+log-likelihood and inspect its convergence status. Multiple starts
+reduce sensitivity to initialization but do not guarantee a global
+likelihood maximum.
+
+```{r fit-level-models, results='hide', cache=TRUE}
+candidate_states <- 2:5
+level_seeds <- 123:147
+
+level_runs <- lapply(candidate_states, function(k) {
+  fit_multiple_starts(
+    response = Temperature ~ 1,
+    data = climate_data,
+    k = k,
+    seeds = level_seeds
+  )
+})
+
+names(level_runs) <- as.character(candidate_states)
+
+level_models <- lapply(level_runs, function(x) x$model)
+
+level_comparison <- data.frame(
+  States = candidate_states,
+  LogLik = vapply(
+    level_models,
+    function(model) as.numeric(logLik(model)),
+    numeric(1)
+  ),
+  AIC = vapply(level_models, AIC, numeric(1)),
+  BIC = vapply(level_models, BIC, numeric(1))
+)
+
+rownames(level_comparison) <- NULL
+
+stopifnot(
+  all(is.finite(level_comparison$LogLik)),
+  all(is.finite(level_comparison$AIC)),
+  all(is.finite(level_comparison$BIC))
+)
+
+best_level_k <- level_comparison$States[
+  which.min(level_comparison$BIC)
+]
+
+best_level_fit <- level_models[[as.character(best_level_k)]]
+```
+
+```{r level-model-comparison, results='asis'}
+knitr::kable(
+  level_comparison,
+  format = "latex",
+  booktabs = TRUE,
+  digits = 2,
+  row.names = FALSE,
+  col.names = c("States", "Log-likelihood", "AIC", "BIC"),
+  caption = "Comparison of state-dependent level models.",
+  table.envir = "table",
+  position = "H"
+)
+```
+Both AIC and BIC decrease across the candidate models, reaching their
+lowest values with five states. We therefore retain the five-state
+specification for further analysis.
+
+Since this is the largest model considered, the comparison does not
+establish that five states would remain preferred over a wider candidate
+set. Additional states may also approximate a changing temperature
+level, rather than identify distinct physical climate regimes.
+States are ordered by increasing estimated mean anomaly.
+The table reports the Gaussian parameters estimated by the HMM
+and the number of observations assigned to each state by Viterbi
+decoding. These counts summarize the decoded sequence.
+
+```{r level-state-parameters}
+level_parameters <- t(vapply(
+  seq_len(best_level_k),
+  function(j) {
+    getpars(best_level_fit@response[[j]][[1]])
+  },
+  numeric(2)
+))
+
+level_order <- order(level_parameters[, 1])
+
+level_means <- level_parameters[level_order, 1]
+level_sds <- level_parameters[level_order, 2]
+
+state_mapping <- integer(best_level_k)
+state_mapping[level_order] <- seq_len(best_level_k)
+
+level_states_raw <- posterior(best_level_fit, type = "viterbi")$state
+level_states <- state_mapping[level_states_raw]
+
+level_decoded <- climate_data
+level_decoded$State <- factor(
+  level_states,
+  levels = seq_len(best_level_k)
+)
+level_decoded$StateMean <- level_means[level_states]
+
+level_state_table <- data.frame(
+  State = seq_len(best_level_k),
+  Mean = level_means,
+  SD = level_sds,
+  Months = tabulate(level_states, nbins = best_level_k)
+)
+
+stopifnot(
+  length(level_states) == nrow(climate_data),
+  sum(level_state_table$Months) == nrow(climate_data),
+  all(is.finite(level_parameters)),
+  all(level_sds > 0)
+)
+```
+
+```{r level-state-table, results='asis'}
+knitr::kable(
+  level_state_table,
+  format = "latex",
+  booktabs = TRUE,
+  digits = 3,
+  row.names = FALSE,
+  col.names = c("State", "Mean (°C)", "SD (°C)", "Decoded months"),
+  caption = "Estimated state parameters and decoded occupancy.",
+  position = "H"
+)
+```
+
+The decoded sequence is shown below. Colored observations indicate
+the most likely joint state sequence, while the black step line
+shows the corresponding estimated state mean. Decoding uses the
+entire sample and therefore provides a retrospective classification.
+
+```{r level-decoded-plot, fig.cap="Seasonally adjusted temperature anomalies colored by Viterbi-decoded state. States are ordered by increasing estimated mean. The black line follows the estimated mean of the decoded state."}
+ggplot(level_decoded, aes(x = Date)) +
+  geom_line(
+    aes(y = Temperature),
+    color = "grey75",
+    linewidth = 0.25
+  ) +
+  geom_point(
+    aes(y = Temperature, color = State),
+    size = 0.65,
+    alpha = 0.8
+  ) +
+  geom_step(
+    aes(y = StateMean),
+    color = "#222222",
+    linewidth = 0.45
+  ) +
+  scale_color_manual(
+    values = c(
+      "#355C7D", "#5A9A9C", "#8A9B55",
+      "#D39A45", "#AD5148"
+    )[seq_len(best_level_k)]
+  ) +
+  scale_x_date(
+    breaks = as.Date(paste0(seq(1880, 2020, 20), "-01-01")),
+    date_labels = "%Y"
+  ) +
+  labs(
+    x = "Year",
+    y = "Temperature anomaly (°C)",
+    color = "State"
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "#E8E8E8",
+      linewidth = 0.2
+    ),
+    panel.border = element_rect(
+      color = "#888888",
+      linewidth = 0.3
+    )
+  )
+```
+The estimated state means range from $-0.449\,^\circ\mathrm{C}$
+to $1.288\,^\circ\mathrm{C}$.
+The earlier observations are mainly assigned to the lower-mean
+states, while the two highest-mean states predominantly describe
+the later decades.
+
+In the five-state level model, two sustained transitions stand
+out in the decoded sequence: entry into State 4 in February 1997,
+which persists through November 2014, and entry into State 5
+in December 2014, which continues to the sample end.
+Before 1980, the path repeatedly switches among lower-mean states.
+These dates summarize the fitted retrospective classification;
+they are not independently established physical change points.
+
+The decoded path switches repeatedly among the lower states,
+whereas the recent warming is represented by sustained higher
+levels. This illustrates a limitation of the specification:
+a model with constant state means can approximate a gradual
+trend through successive changes of state. The decoded transitions
+should therefore not automatically be interpreted as abrupt
+physical changes in the climate system.
+
+We examine the fitted transition probabilities to assess state
+persistence. Each entry gives the probability of moving from
+the row state to the column state in the following month.
+These are HMM parameter estimates, rather than transition
+frequencies calculated from the decoded sequence.
+
+```{r level-transition-matrix}
+level_transition_raw <- t(vapply(
+  seq_len(best_level_k),
+  function(j) {
+    as.numeric(
+      predict(best_level_fit@transition[[j]])
+    )
+  },
+  numeric(best_level_k)
+))
+
+level_transition <- level_transition_raw[
+  level_order,
+  level_order,
+  drop = FALSE
+]
+
+stopifnot(
+  all(is.finite(level_transition)),
+  all(level_transition >= -1e-8),
+  all(level_transition <= 1 + 1e-8),
+  all(abs(rowSums(level_transition) - 1) < 1e-8)
+)
+
+level_transition_table <- data.frame(
+  From = paste("State", seq_len(best_level_k)),
+  level_transition,
+  check.names = FALSE
+)
+
+names(level_transition_table)[-1] <- paste(
+  "State", seq_len(best_level_k)
+)
+```
+
+```{r level-transition-table, results='asis'}
+knitr::kable(
+  level_transition_table,
+  format = "latex",
+  booktabs = TRUE,
+  digits = 3,
+  row.names = FALSE,
+  caption = "Estimated monthly transition probabilities for the level model.",
+  position = "H"
+)
+```
+The estimated probabilities of remaining in the same state range
+from approximately 0.900 to 1.000. Transitions mainly occur between
+states with adjacent mean levels.
+
+For the highest-mean state, the estimated probability of remaining
+in that state rounds to one. The decoded sequence assigns this
+state to the final part of the sample, with no observed departure.
+This limits the information available about exits from that state;
+the estimate should not be interpreted as evidence that the
+climate has entered a permanently absorbing regime.
+
+# Analysis up to 1975
+
+We repeat the level-model analysis using observations from January
+1880 to December 1975. Periodic STL is re-estimated on this shorter
+sample, excluding subsequent observations from seasonal adjustment.
+
+We again compare models with two to five states using AIC and BIC.
+These criteria are used to compare specifications within this sample;
+their values are not directly comparable with those obtained over
+the full sample.
+
+```{r fit-pre1975-models, results='hide', cache=TRUE}
+temperature_pre1975 <- window(
+  gistemp_ts,
+  end = c(1975, 12)
+)
+
+seasonal_pre1975 <- stl(
+  temperature_pre1975,
+  s.window = "periodic"
+)
+
+adjusted_pre1975 <- temperature_pre1975 -
+  seasonal_pre1975$time.series[, "seasonal"]
+
+climate_pre1975 <- data.frame(
+  Date = as.Date(as.yearmon(time(temperature_pre1975))),
+  Time = as.numeric(time(temperature_pre1975)),
+  Temperature = as.numeric(adjusted_pre1975)
+)
+
+pre1975_seeds <- 123:147
+
+pre1975_runs <- lapply(candidate_states, function(k) {
+  fit_multiple_starts(
+    response = Temperature ~ 1,
+    data = climate_pre1975,
+    k = k,
+    seeds = pre1975_seeds
+  )
+})
+
+names(pre1975_runs) <- as.character(candidate_states)
+
+pre1975_models <- lapply(pre1975_runs, function(x) x$model)
+
+pre1975_comparison <- data.frame(
+  States = candidate_states,
+  LogLik = vapply(
+    pre1975_models,
+    function(model) as.numeric(logLik(model)),
+    numeric(1)
+  ),
+  AIC = vapply(pre1975_models, AIC, numeric(1)),
+  BIC = vapply(pre1975_models, BIC, numeric(1))
+)
+
+rownames(pre1975_comparison) <- NULL
+
+stopifnot(
+  all(is.finite(climate_pre1975$Temperature)),
+  all(is.finite(pre1975_comparison$LogLik)),
+  all(is.finite(pre1975_comparison$AIC)),
+  all(is.finite(pre1975_comparison$BIC))
+)
+
+best_pre1975_k <- pre1975_comparison$States[
+  which.min(pre1975_comparison$BIC)
+]
+
+best_pre1975_fit <- pre1975_models[[
+  as.character(best_pre1975_k)
+]]
+```
+
+```{r pre1975-model-comparison, results='asis'}
+knitr::kable(
+  pre1975_comparison,
+  format = "latex",
+  booktabs = TRUE,
+  digits = 2,
+  row.names = FALSE,
+  col.names = c("States", "Log-likelihood", "AIC", "BIC"),
+  caption = "Comparison of level models for January 1880 to December 1975.",
+  position = "H"
+)
+```
+Each candidate model is estimated from 25 reproducible random
+initializations. BIC reaches its minimum with three states,
+whereas AIC favors the five-state model. We retain three states
+according to the stated BIC selection rule. The four-state
+specification has a relatively close BIC, differing by
+`r sprintf("%.2f", pre1975_comparison$BIC[pre1975_comparison$States == 4] - min(pre1975_comparison$BIC))`
+points.
+
+Compared with the five states selected over the full sample,
+the shorter period supports a more parsimonious level
+representation under BIC. This difference is descriptive:
+sample length, seasonal adjustment, and the observed temperature
+patterns all change between the two analyses.
+
+States are ordered by increasing estimated mean anomaly.
+Their labels refer to this fitted model and do not imply an
+exact correspondence with the states of the full-sample model.
+
+```{r pre1975-state-parameters}
+pre1975_parameters <- t(vapply(
+  seq_len(best_pre1975_k),
+  function(j) {
+    getpars(best_pre1975_fit@response[[j]][[1]])
+  },
+  numeric(2)
+))
+
+pre1975_order <- order(pre1975_parameters[, 1])
+pre1975_means <- pre1975_parameters[pre1975_order, 1]
+pre1975_sds <- pre1975_parameters[pre1975_order, 2]
+
+pre1975_mapping <- integer(best_pre1975_k)
+pre1975_mapping[pre1975_order] <- seq_len(best_pre1975_k)
+
+pre1975_states_raw <- posterior(best_pre1975_fit, type = "viterbi")$state
+pre1975_states <- pre1975_mapping[pre1975_states_raw]
+
+pre1975_decoded <- climate_pre1975
+pre1975_decoded$State <- factor(
+  pre1975_states,
+  levels = seq_len(best_pre1975_k)
+)
+pre1975_decoded$StateMean <- pre1975_means[pre1975_states]
+
+pre1975_state_table <- data.frame(
+  State = seq_len(best_pre1975_k),
+  Mean = pre1975_means,
+  SD = pre1975_sds,
+  Months = tabulate(pre1975_states, nbins = best_pre1975_k)
+)
+
+stopifnot(
+  length(pre1975_states) == nrow(climate_pre1975),
+  sum(pre1975_state_table$Months) == nrow(climate_pre1975),
+  all(is.finite(pre1975_parameters)),
+  all(pre1975_sds > 0)
+)
+```
+
+```{r pre1975-state-table, results='asis'}
+knitr::kable(
+  pre1975_state_table,
+  format = "latex",
+  booktabs = TRUE,
+  digits = 3,
+  row.names = FALSE,
+  col.names = c("State", "Mean (°C)", "SD (°C)", "Decoded months"),
+  caption = "Estimated state parameters and decoded occupancy up to 1975.",
+  position = "H"
+)
+```
+
+```{r pre1975-decoded-plot, fig.cap="Seasonally adjusted temperature anomalies up to December 1975, colored by Viterbi-decoded state. The black line follows the estimated mean of the decoded state."}
+ggplot(pre1975_decoded, aes(x = Date)) +
+  geom_line(
+    aes(y = Temperature),
+    color = "grey75",
+    linewidth = 0.25
+  ) +
+  geom_point(
+    aes(y = Temperature, color = State),
+    size = 0.65,
+    alpha = 0.8
+  ) +
+  geom_step(
+    aes(y = StateMean),
+    color = "#222222",
+    linewidth = 0.45
+  ) +
+  scale_color_manual(
+    values = c(
+      "#355C7D", "#5A9A9C", "#8A9B55",
+      "#D39A45", "#AD5148"
+    )[seq_len(best_pre1975_k)]
+  ) +
+  scale_x_date(
+    breaks = as.Date(paste0(seq(1880, 1960, 20), "-01-01")),
+    date_labels = "%Y"
+  ) +
+  labs(
+    x = "Year",
+    y = "Temperature anomaly (°C)",
+    color = "State"
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "#E8E8E8",
+      linewidth = 0.2
+    ),
+    panel.border = element_rect(
+      color = "#888888",
+      linewidth = 0.3
+    )
+  )
+```
+The three estimated state means range from
+$-0.451\,^\circ\mathrm{C}$ to $0.113\,^\circ\mathrm{C}$.
+The lower-mean states mainly describe the earlier decades,
+while the highest-mean state becomes more prominent from
+the 1930s onward. The decoded path also returns to lower states,
+rather than following a strictly increasing sequence.
+
+Without the recent high-anomaly observations, a three-state
+level model provides a more compact description under BIC.
+However, the earlier sample still exhibits changes over time:
+the reduced number of states does not establish stationarity
+or confirm the existence of discrete physical regimes.
+The transition matrix below reports the estimated monthly
+probabilities for the shorter sample, with states ordered
+by increasing mean anomaly.
+
+```{r pre1975-transition-matrix}
+pre1975_transition_raw <- t(vapply(
+  seq_len(best_pre1975_k),
+  function(j) {
+    as.numeric(
+      predict(best_pre1975_fit@transition[[j]])
+    )
+  },
+  numeric(best_pre1975_k)
+))
+
+pre1975_transition <- pre1975_transition_raw[
+  pre1975_order,
+  pre1975_order,
+  drop = FALSE
+]
+
+stopifnot(
+  all(is.finite(pre1975_transition)),
+  all(pre1975_transition >= -1e-8),
+  all(pre1975_transition <= 1 + 1e-8),
+  all(abs(rowSums(pre1975_transition) - 1) < 1e-8)
+)
+
+pre1975_transition_table <- data.frame(
+  From = paste("State", seq_len(best_pre1975_k)),
+  pre1975_transition,
+  check.names = FALSE
+)
+
+names(pre1975_transition_table)[-1] <- paste(
+  "State", seq_len(best_pre1975_k)
+)
+```
+
+```{r pre1975-transition-table, results='asis'}
+knitr::kable(
+  pre1975_transition_table,
+  format = "latex",
+  booktabs = TRUE,
+  digits = 3,
+  row.names = FALSE,
+  caption = "Estimated monthly transition probabilities up to 1975.",
+  position = "H"
+)
+```
+All three states exhibit persistence, with estimated monthly
+self-transition probabilities ranging from
+`r sprintf("%.3f", min(diag(pre1975_transition)))` to
+`r sprintf("%.3f", max(diag(pre1975_transition)))`.
+Unlike the full-sample model, no state has an estimated
+self-transition probability at the boundary value of one.
+However, these probabilities are comparable to those of
+the three lowest-mean states in the full-sample model.
+
+Transitions mainly connect adjacent mean levels, allowing
+movement toward both higher and lower anomalies. Persistence
+alone does not establish that the states represent distinct,
+long-lasting physical climate regimes.
+
+# State-Dependent Linear Trend Model
+
+To allow temperature anomalies to change within each state,
+we replace the constant state means with linear functions of time:
+
+\[
+Y_t \mid S_t=j \sim
+\mathcal{N}\!\left(\alpha_j+\beta_j(t-1950),\sigma_j^2\right).
+\]
+
+Here, \(t\) is calendar time in years, \(\alpha_j\) is the
+state-specific expected anomaly at 1950, and \(\beta_j\) is
+the slope in degrees Celsius per year.
+
+Transition probabilities remain constant over time.
+The model does not impose continuity between state-specific
+lines, so the decoded conditional mean may jump when states change.
+
+We fit two- to five-state specifications to the full seasonally
+adjusted sample and retain the model with the lowest BIC.
+
+Each candidate model is estimated from 150 reproducible random
+initializations. We retain the fit with the highest finite
+log-likelihood and inspect its convergence status. A global
+likelihood maximum is not guaranteed.
+```{r fit-trend-models, results='hide', cache=TRUE}
+climate_data$TimeCentered <- climate_data$Time - 1950
+
+trend_seeds <- 123:272
+
+trend_runs <- lapply(candidate_states, function(k) {
+  fit_multiple_starts(
+    response = Temperature ~ TimeCentered,
+    data = climate_data,
+    k = k,
+    seeds = trend_seeds
+  )
+})
+
+names(trend_runs) <- as.character(candidate_states)
+
+trend_models <- lapply(trend_runs, function(x) x$model)
+
+trend_comparison <- data.frame(
+  States = candidate_states,
+  LogLik = vapply(
+    trend_models,
+    function(model) as.numeric(logLik(model)),
+    numeric(1)
+  ),
+  AIC = vapply(trend_models, AIC, numeric(1)),
+  BIC = vapply(trend_models, BIC, numeric(1))
+)
+
+rownames(trend_comparison) <- NULL
+
+stopifnot(
+  all(is.finite(trend_comparison$LogLik)),
+  all(is.finite(trend_comparison$AIC)),
+  all(is.finite(trend_comparison$BIC))
+)
+
+best_trend_k <- trend_comparison$States[
+  which.min(trend_comparison$BIC)
+]
+
+best_trend_fit <- trend_models[[as.character(best_trend_k)]]
+```
+
+```{r trend-model-comparison, results='asis'}
+knitr::kable(
+  trend_comparison,
+  format = "latex",
+  booktabs = TRUE,
+  digits = 2,
+  row.names = FALSE,
+  col.names = c("States", "Log-likelihood", "AIC", "BIC"),
+  caption = "Comparison of state-dependent linear trend models.",
+  position = "H"
+)
+```
+Both AIC and BIC favor the five-state trend model within the
+candidate set. We therefore retain five states. Since this is
+the largest specification considered, the comparison does not
+establish whether additional states would further improve
+the information criteria.
+
+The selected trend model has a lower BIC than the selected
+level model, by approximately
+`r sprintf("%.1f", BIC(best_level_fit) - BIC(best_trend_fit))`
+points. Both models use the same observations and seasonal
+adjustment, so this comparison favors allowing within-state
+linear trends among the specifications considered. It does
+not establish that the decoded states correspond to physical
+climate regimes.
+
+States are ordered by increasing estimated slope. The intercept
+represents the expected anomaly at 1950 under each state-specific
+line; for states mainly occupied in other periods, this is an
+extrapolated reference value.
+
+The plotted conditional mean is calculated directly from the
+estimated HMM coefficients along the Viterbi-decoded sequence.
+
+```{r trend-state-parameters}
+trend_parameters_raw <- t(vapply(
+  seq_len(best_trend_k),
+  function(j) {
+    getpars(best_trend_fit@response[[j]][[1]])
+  },
+  numeric(3)
+))
+
+trend_order <- order(trend_parameters_raw[, 2])
+trend_parameters <- trend_parameters_raw[
+  trend_order,
+  ,
+  drop = FALSE
+]
+
+trend_mapping <- integer(best_trend_k)
+trend_mapping[trend_order] <- seq_len(best_trend_k)
+
+trend_states_raw <- posterior(best_trend_fit, type = "viterbi")$state
+trend_states <- trend_mapping[trend_states_raw]
+
+trend_decoded <- climate_data
+trend_decoded$State <- factor(
+  trend_states,
+  levels = seq_len(best_trend_k)
+)
+
+trend_decoded$StateMean <-
+  trend_parameters[trend_states, 1] +
+  trend_parameters[trend_states, 2] *
+  trend_decoded$TimeCentered
+
+trend_state_table <- data.frame(
+  State = seq_len(best_trend_k),
+  Intercept = trend_parameters[, 1],
+  Slope = trend_parameters[, 2],
+  SD = trend_parameters[, 3],
+  Months = tabulate(trend_states, nbins = best_trend_k)
+)
+
+stopifnot(
+  all(is.finite(trend_parameters)),
+  all(trend_parameters[, 3] > 0),
+  length(trend_states) == nrow(climate_data),
+  sum(trend_state_table$Months) == nrow(climate_data),
+  all(is.finite(trend_decoded$StateMean))
+)
+```
+
+```{r trend-state-table, results='asis'}
+knitr::kable(
+  trend_state_table,
+  format = "latex",
+  booktabs = TRUE,
+  digits = c(0, 3, 4, 3, 0),
+  row.names = FALSE,
+  col.names = c(
+    "State", "Intercept (°C)", "Slope (°C/year)",
+    "SD (°C)", "Decoded months"
+  ),
+  caption = "Estimated parameters and decoded occupancy of the trend model.",
+  position = "H"
+)
+```
+
+```{r trend-decoded-plot, fig.cap="Temperature anomalies colored by Viterbi-decoded state in the linear trend model. States are ordered by increasing slope. The black line follows the state-specific conditional mean along the decoded path."}
+ggplot(trend_decoded, aes(x = Date)) +
+  geom_line(
+    aes(y = Temperature),
+    color = "grey75",
+    linewidth = 0.25
+  ) +
+  geom_point(
+    aes(y = Temperature, color = State),
+    size = 0.65,
+    alpha = 0.8
+  ) +
+  geom_line(
+    aes(y = StateMean),
+    color = "#222222",
+    linewidth = 0.5
+  ) +
+  scale_color_manual(
+    values = c(
+      "#355C7D", "#5A9A9C", "#D39A45",
+      "#AD5148", "#8A9B55"
+    )[seq_len(best_trend_k)]
+  ) +
+  scale_x_date(
+    breaks = as.Date(paste0(seq(1880, 2020, 20), "-01-01")),
+    date_labels = "%Y"
+  ) +
+  labs(
+    x = "Year",
+    y = "Temperature anomaly (°C)",
+    color = "State"
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "#E8E8E8",
+      linewidth = 0.2
+    ),
+    panel.border = element_rect(
+      color = "#888888",
+      linewidth = 0.3
+    )
+  )
+```
+The estimated slopes range from
+`r sprintf("%.4f", min(trend_state_table$Slope))` to
+`r sprintf("%.4f", max(trend_state_table$Slope))` °C per year.
+State 1 has a nearly flat fitted line. States 3 and 4 have
+similar slopes but different intercepts, so they describe
+different anomaly levels despite comparable rates of change.
+
+The decoded path revisits states across different periods.
+The highest-slope state appears during parts of the
+1910s–1940s as well as in recent years. State labels therefore
+do not represent a chronological sequence of successive
+warming phases.
+
+Allowing within-state trends captures gradual changes that
+the level model represents through discrete shifts.
+However, frequent switches between fitted lines still
+produce jumps in the conditional mean. The decoded path
+remains a descriptive approximation rather than evidence
+of discrete physical climate regimes.
+
+# Model Comparison
+
+We compare the selected level and trend models with a two-state
+trend specification as a simpler benchmark. All models in the
+table use the same full sample and seasonal adjustment.
+
+The model fitted up to 1975 is excluded from this information-criterion
+comparison because it uses different observations.
+
+```{r full-sample-model-comparison}
+comparison_models <- list(
+  "Selected level model" = best_level_fit,
+  "Selected trend model" = best_trend_fit,
+  "Two-state trend model" = trend_models[["2"]]
+)
+
+model_comparison <- data.frame(
+  Model = names(comparison_models),
+  States = c(best_level_k, best_trend_k, 2),
+  Parameters = vapply(
+    comparison_models,
+    function(model) as.numeric(attr(logLik(model), "df")),
+    numeric(1)
+  ),
+  LogLik = vapply(
+    comparison_models,
+    function(model) as.numeric(logLik(model)),
+    numeric(1)
+  ),
+  AIC = vapply(comparison_models, AIC, numeric(1)),
+  BIC = vapply(comparison_models, BIC, numeric(1))
+)
+
+rownames(model_comparison) <- NULL
+```
+
+```{r full-sample-comparison-table, results='asis'}
+knitr::kable(
+  model_comparison,
+  format = "latex",
+  booktabs = TRUE,
+  digits = 2,
+  row.names = FALSE,
+  col.names = c(
+    "Model", "States", "Parameters",
+    "Log-likelihood", "AIC", "BIC"
+  ),
+  caption = "Comparison of selected models and the two-state trend benchmark.",
+  position = "H"
+)
+```
+Among the three specifications reported here, the five-state
+trend model has the lowest AIC and BIC. Its improvement in
+fitted likelihood relative to the five-state level model
+outweighs the penalty for its additional parameters.
+
+The two-state trend benchmark has substantially higher
+information criteria. Its simpler representation is therefore
+less supported by this comparison. However, a two-state HMM
+allows repeated switches between states: it should not be
+interpreted as a model restricted to a single change point.
+
+These comparisons concern in-sample fit penalized for model
+complexity; they do not establish forecasting performance.
+
+The decoded two-state benchmark illustrates how the simpler
+specification represents the same observations. States are
+ordered by increasing estimated slope, and the black line
+follows the fitted conditional mean along the decoded sequence.
+
+```{r two-state-trend-decoding}
+two_state_fit <- trend_models[["2"]]
+
+two_state_parameters_raw <- t(vapply(
+  1:2,
+  function(j) {
+    getpars(two_state_fit@response[[j]][[1]])
+  },
+  numeric(3)
+))
+
+two_state_order <- order(two_state_parameters_raw[, 2])
+two_state_parameters <- two_state_parameters_raw[
+  two_state_order,
+  ,
+  drop = FALSE
+]
+
+two_state_mapping <- integer(2)
+two_state_mapping[two_state_order] <- 1:2
+
+two_state_raw <- posterior(two_state_fit, type = "viterbi")$state
+two_state_states <- two_state_mapping[two_state_raw]
+
+two_state_decoded <- climate_data
+two_state_decoded$State <- factor(
+  two_state_states,
+  levels = 1:2
+)
+
+two_state_decoded$StateMean <-
+  two_state_parameters[two_state_states, 1] +
+  two_state_parameters[two_state_states, 2] *
+  two_state_decoded$TimeCentered
+
+stopifnot(
+  length(two_state_states) == nrow(climate_data),
+  all(is.finite(two_state_parameters)),
+  all(two_state_parameters[, 3] > 0),
+  all(is.finite(two_state_decoded$StateMean))
+)
+```
+
+```{r two-state-trend-plot, fig.cap="Two-state linear trend benchmark: seasonally adjusted anomalies colored by Viterbi-decoded state. The black line follows the estimated conditional mean. State labels are specific to this model."}
+ggplot(two_state_decoded, aes(x = Date)) +
+  geom_line(
+    aes(y = Temperature),
+    color = "grey75",
+    linewidth = 0.25
+  ) +
+  geom_point(
+    aes(y = Temperature, color = State),
+    size = 0.65,
+    alpha = 0.8
+  ) +
+  geom_line(
+    aes(y = StateMean),
+    color = "#222222",
+    linewidth = 0.5
+  ) +
+  scale_color_manual(
+    values = c("#355C7D", "#AD5148")
+  ) +
+  scale_x_date(
+    breaks = as.Date(paste0(seq(1880, 2020, 20), "-01-01")),
+    date_labels = "%Y"
+  ) +
+  labs(
+    x = "Year",
+    y = "Temperature anomaly (°C)",
+    color = "State"
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "#E8E8E8",
+      linewidth = 0.2
+    ),
+    panel.border = element_rect(
+      color = "#888888",
+      linewidth = 0.3
+    )
+  )
+```
+The two-state model captures the broad increase in anomalies,
+but the decoded mean switches repeatedly between its two fitted
+lines, particularly during the 1980s and 1990s. This illustrates
+how a small number of state-specific trends can produce abrupt
+changes in the fitted path despite gradual movements in the data.
+
+We summarize switching frequency and spell lengths in the decoded
+paths. We also examine lag-one autocorrelation of deviations from
+the decoded state-specific means. These are descriptive diagnostics:
+decoded states are estimated from the same observations.
+
+```{r decoded-path-diagnostics}
+summarize_path <- function(label, states, observed, fitted_mean) {
+  spells <- rle(as.integer(states))
+  residuals <- observed - fitted_mean
+
+  data.frame(
+    Model = label,
+    Switches = length(spells$lengths) - 1L,
+    MedianSpell = median(spells$lengths),
+    ResidualACF = as.numeric(
+      acf(residuals, lag.max = 1, plot = FALSE)$acf[2]
+    )
+  )
+}
+
+path_diagnostics <- rbind(
+  summarize_path(
+    "Full-sample level",
+    level_states,
+    level_decoded$Temperature,
+    level_decoded$StateMean
+  ),
+  summarize_path(
+    "Level up to 1975",
+    pre1975_states,
+    pre1975_decoded$Temperature,
+    pre1975_decoded$StateMean
+  ),
+  summarize_path(
+    "Selected trend",
+    trend_states,
+    trend_decoded$Temperature,
+    trend_decoded$StateMean
+  ),
+  summarize_path(
+    "Two-state trend",
+    two_state_states,
+    two_state_decoded$Temperature,
+    two_state_decoded$StateMean
+  )
+)
+
+knitr::kable(
+  path_diagnostics,
+  format = "latex",
+  booktabs = TRUE,
+  digits = c(0, 0, 1, 2),
+  row.names = FALSE,
+  col.names = c(
+    "Model", "State switches",
+    "Median spell (months)", "Residual ACF(1)"
+  ),
+  caption = "Decoded-path persistence and residual autocorrelation.",
+  position = "H"
+)
+```
+The selected five-state trend model produces 178 decoded
+state switches, with a median spell length of seven months,
+compared with 86 switches and eleven months for the full-sample
+level model. Its improved information criteria therefore
+accompany a more fragmented decoded path, rather than a
+partition into a few sustained climate phases. The sample
+ending in 1975 also exhibits frequent switching.
+
+Lag-one residual autocorrelation remains positive in all
+specifications. It is lower for the selected trend model
+(0.15) than for the full-sample level model (0.39) and the
+two-state trend benchmark (0.55). These descriptive diagnostics
+suggest remaining serial structure, but do not constitute a
+formal test of conditional independence or establish overfitting.
+
+# Discussion and Limitations
+
+Gaussian Hidden Markov Models provide a descriptive representation
+of temperature anomalies through latent states. BIC selects five
+states for the full-sample level model and three for the sample
+ending in 1975. Allowing state-specific linear trends improves
+the full-sample information criteria, with both AIC and BIC
+favoring five states within the candidate set.
+
+The results depend on the observation model. Constant state means
+approximate gradual warming through changes of level, while
+state-dependent trends allow movement within states but still
+permit discontinuities when states change. The selected trend
+model produces more frequent decoded switches and shorter median
+spells than the level model. Improved information criteria therefore
+do not imply a clearer partition into sustained climate regimes.
+
+The specifications assume Gaussian observations, conditional
+independence given the states, and constant transition probabilities.
+Positive lag-one autocorrelation remains in deviations from the
+decoded conditional means, suggesting residual serial structure.
+This diagnostic does not constitute a formal test of conditional
+independence. Additional states may partly accommodate dependence
+or gradual change rather than identify distinct physical regimes.
+
+Model selection is restricted to two through five states.
+Estimation uses 25 random initializations per candidate for the
+level models and 150 for the trend models. Multiple starts reduce
+sensitivity to initialization but do not guarantee a global
+likelihood maximum. Both selected full-sample models lie at the
+upper end of the candidate range. Boundary transition estimates
+also limit interpretation of state persistence.
+
+Uncertainty in seasonal adjustment, parameter estimates, and
+state assignments is not propagated into the reported results.
+Estimation and decoding are retrospective: the analysis does
+not establish physical change points, real-time state
+identification, or out-of-sample forecasting performance.
