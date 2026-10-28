@@ -39,3 +39,8 @@ The analysis performs 800 model fits. A complete run may take 15 minutes or long
 The decoded states provide a retrospective statistical description, rather than independently identified physical climate regimes.
 
 Model selection is limited to two through five states. Multiple initializations reduce sensitivity to local likelihood maxima but do not guarantee a global optimum. Residual serial dependence and uncertainty in seasonal adjustment and state assignments also limit interpretation.
+
+## Author
+
+Gianmaria Monaco  
+Bocconi University · Time Series Analysis · Academic year 2025–2026 · Group 32
