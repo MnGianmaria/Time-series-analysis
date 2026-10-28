@@ -1,0 +1,3205 @@
+---
+title: "Climate Trends and Weather Prediction"
+author: "Gianmaria Monaco | Bocconi University | Time Series Analysis | Group 32"
+output:
+  pdf_document:
+    number_sections: true
+fontsize: 11pt
+geometry: margin=1in
+documentclass: article
+header-includes:
+  - \usepackage{float}
+  - \usepackage{booktabs}
+  - \usepackage{caption}
+  - \captionsetup[figure]{font=small,labelfont=bf,textfont=it,labelsep=period,justification=raggedright,singlelinecheck=false,skip=6pt}
+  - \captionsetup[table]{font=small,labelfont=bf,textfont=it,labelsep=period,justification=raggedright,singlelinecheck=false,skip=6pt,position=top}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 6,
+  fig.height = 3,
+  out.width = "95%",
+  fig.align = "center",
+  fig.pos = "H"
+)
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(zoo)
+library(depmixS4)
+library(dlm)
+library(knitr)
+library(patchwork)
+```
+
+# Introduction
+
+This analysis examines long-term temperature changes and
+daily weather prediction through three applications of
+latent-state time series models.
+
+*First*, we analyze monthly Northern Hemisphere temperature
+anomalies from GISTEMP over 1880–2025. After exploring the
+series and removing its residual seasonal component, we fit
+Gaussian Hidden Markov Models with different numbers of
+states. Information criteria guide model selection, and
+Viterbi decoding describes the sequence of latent states.
+We assess whether these states provide a useful summary
+of long-term changes and discuss the limitations of
+representing gradual warming through discrete levels.
+
+*Second*, we analyze the same seasonally adjusted series using
+a random walk plus noise model and a local linear trend
+model. Variance parameters are estimated by maximum
+likelihood, and Kalman filtering and smoothing reconstruct
+the latent temperature level. Ten-year changes in the
+smoothed level describe how the magnitude of warming varies
+across the record. We distinguish these changes from the
+LLT slope and compare the continuous-valued representation
+with the discrete states of the HMM.
+
+*Third*, we examine daily maximum temperatures at Houlton AP
+and Augusta State AP using GHCN observations. The analysis
+covers January 1988–December 2024, a complete daily period
+for both stations that avoids a prolonged gap in the earlier
+Houlton record. After removing the annual seasonal pattern,
+we fit three bivariate Dynamic Linear Models: independent
+state innovations, unrestricted innovation covariance, and
+distance-based covariance. We compare their fit,
+interpretability, and in-sample one-step-ahead prediction
+errors to assess the contribution of cross-station dependence.
+
+The GISTEMP analysis provides a retrospective description
+of temperature dynamics. The weather predictions are
+evaluated with parameters and seasonal adjustment estimated
+on the same sample, so their comparison does not establish
+out-of-sample forecasting performance.
+
+# Temperature Anomalies and Seasonal Adjustment
+
+The analysis uses the GISTEMP record of monthly Northern
+Hemisphere temperature anomalies, measured in degrees Celsius
+relative to the calendar-month averages for 1951–1980.
+We extract the monthly columns from the supplied dataset,
+obtaining a complete series of 1,752 observations from
+January 1880 to December 2025 that requires no interpolation.
+
+```{r load-gistemp}
+gistemp_path <- "data/gistemp.csv"
+
+if (!file.exists(gistemp_path)) {
+  gistemp_path <- paste0(
+    "https://raw.githubusercontent.com/",
+    "MnGianmaria/Time-series-analysis/main/",
+    "07_climate_and_weather_models/data/gistemp.csv"
+  )
+}
+
+gistemp_raw <- read.csv(
+  gistemp_path,
+  skip = 1,
+  na.strings = "***",
+  check.names = FALSE
+)
+
+month_names <- c(
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+)
+
+monthly_values <- as.numeric(
+  t(as.matrix(gistemp_raw[, month_names]))
+)
+
+stopifnot(
+  identical(as.integer(gistemp_raw$Year), 1880:2025),
+  length(monthly_values) == 1752,
+  all(is.finite(monthly_values))
+)
+
+gistemp_ts <- ts(
+  monthly_values,
+  start = c(1880, 1),
+  frequency = 12
+)
+
+gistemp_data <- data.frame(
+  Date = as.Date(as.yearmon(time(gistemp_ts))),
+  Temperature = as.numeric(gistemp_ts)
+)
+```
+
+To separate the long-term movement from residual seasonality,
+we apply additive STL decomposition with a periodic seasonal
+window and subtract the estimated seasonal component.
+Since the observations are already anomalies relative to
+calendar-month averages, this adjustment concerns the seasonal
+pattern remaining in the anomaly series. The periodic
+specification holds that pattern fixed across years, with
+estimation based on the full record for this retrospective
+analysis.
+
+```{r gistemp-seasonal-adjustment}
+gistemp_stl <- stl(
+  gistemp_ts,
+  s.window = "periodic"
+)
+
+gistemp_adj <- gistemp_ts -
+  gistemp_stl$time.series[, "seasonal"]
+
+climate_data <- data.frame(
+  Date = gistemp_data$Date,
+  Time = as.numeric(time(gistemp_adj)),
+  Temperature = as.numeric(gistemp_adj)
+)
+
+stopifnot(
+  nrow(climate_data) == length(gistemp_ts),
+  all(is.finite(climate_data$Temperature))
+)
+```
+
+```{r gistemp-exploratory-plots, fig.width=6.4, fig.height=4.2, out.width="100%", fig.cap="Exploratory analysis of GISTEMP monthly anomalies. Panel A groups the original observations by calendar month; panels B and C show their sample ACF and PACF, with lags in months and approximate white-noise reference bounds. Panel D shows the seasonally adjusted series."}
+climate_theme <- theme_bw(base_size = 9) +
+  theme(
+    plot.title = element_text(
+      size = 9,
+      face = "bold",
+      hjust = 0
+    ),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "#E8E8E8",
+      linewidth = 0.2
+    ),
+    panel.border = element_rect(
+      color = "#888888",
+      linewidth = 0.3
+    )
+  )
+
+month_data <- gistemp_data
+month_data$Month <- factor(
+  cycle(gistemp_ts),
+  levels = 1:12,
+  labels = month.abb
+)
+
+p_month <- ggplot(
+  month_data,
+  aes(x = Month, y = Temperature)
+) +
+  geom_boxplot(
+    color = "#243746",
+    fill = "#EDF1F5",
+    linewidth = 0.3,
+    outlier.size = 0.4
+  ) +
+  labs(
+    title = "A  Distribution by month",
+    x = NULL,
+    y = "Anomaly (°C)"
+  ) +
+  climate_theme +
+  theme(axis.text.x = element_text(size = 7))
+
+acf_result <- acf(
+  as.numeric(gistemp_ts),
+  lag.max = 48,
+  plot = FALSE
+)
+
+pacf_result <- pacf(
+  as.numeric(gistemp_ts),
+  lag.max = 48,
+  plot = FALSE
+)
+
+acf_data <- data.frame(
+  Lag = as.numeric(acf_result$lag)[-1],
+  Correlation = as.numeric(acf_result$acf)[-1]
+)
+
+pacf_data <- data.frame(
+  Lag = as.numeric(pacf_result$lag),
+  Correlation = as.numeric(pacf_result$acf)
+)
+
+reference_bound <- qnorm(0.975) /
+  sqrt(length(gistemp_ts))
+
+correlation_plot <- function(data, title, y_label) {
+  ggplot(data, aes(x = Lag, y = Correlation)) +
+    geom_hline(
+      yintercept = 0,
+      color = "grey60",
+      linewidth = 0.3
+    ) +
+    geom_hline(
+      yintercept = c(-reference_bound, reference_bound),
+      color = "#B36B35",
+      linetype = "dashed",
+      linewidth = 0.3
+    ) +
+    geom_segment(
+      aes(xend = Lag, yend = 0),
+      color = "#24476B",
+      linewidth = 0.35
+    ) +
+    scale_x_continuous(
+      breaks = seq(0, 48, 12)
+    ) +
+    labs(
+      title = title,
+      x = "Lag (months)",
+      y = y_label
+    ) +
+    climate_theme
+}
+
+p_acf <- correlation_plot(
+  acf_data,
+  "B  Autocorrelation",
+  "ACF"
+)
+
+p_pacf <- correlation_plot(
+  pacf_data,
+  "C  Partial autocorrelation",
+  "PACF"
+)
+
+p_adjusted <- ggplot(
+  climate_data,
+  aes(x = Date, y = Temperature)
+) +
+  geom_hline(
+    yintercept = 0,
+    color = "grey60",
+    linewidth = 0.3,
+    linetype = "dashed"
+  ) +
+  geom_line(
+    color = "#24476B",
+    linewidth = 0.3
+  ) +
+  scale_x_date(
+    breaks = as.Date(
+      paste0(seq(1880, 2020, 40), "-01-01")
+    ),
+    date_labels = "%Y"
+  ) +
+  labs(
+    title = "D  Seasonally adjusted series",
+    x = "Year",
+    y = "Anomaly (°C)"
+  ) +
+  climate_theme
+
+(p_month | p_acf) / (p_pacf | p_adjusted)
+```
+The monthly distributions have similar medians, although
+dispersion is greater in the winter months, so the boxplots
+do not suggest a pronounced seasonal pattern in the central
+level of the anomalies. Temporal dependence is substantial:
+the ACF remains strongly positive through 48 months, while
+the PACF is dominated by the first lag but retains smaller
+positive values over several subsequent lags. Because these
+correlations are calculated on a series with a changing
+level, they should not be read as identifying a stationary
+autoregressive specification.
+
+The seasonally adjusted series places these patterns in
+context, showing predominantly negative anomalies early in
+the record and a sustained rise in recent decades alongside
+considerable monthly variation. This motivates models that
+allow the underlying level to evolve, while leaving open
+whether discrete states or a continuous-valued latent process
+provide the more useful description.
+
+```{r gistemp-stl-plot, fig.width=6.4, fig.height=4.2, out.width="95%", fig.cap="Additive STL decomposition of Northern Hemisphere temperature anomalies. All components are expressed in degrees Celsius, with separate vertical scales. The seasonal pattern is fixed across years by the periodic specification."}
+stl_components <- data.frame(
+  Date = gistemp_data$Date,
+  Observed = as.numeric(gistemp_ts),
+  Trend = as.numeric(gistemp_stl$time.series[, "trend"]),
+  Seasonal = as.numeric(gistemp_stl$time.series[, "seasonal"]),
+  Remainder = as.numeric(gistemp_stl$time.series[, "remainder"])
+)
+
+stl_long <- pivot_longer(
+  stl_components,
+  cols = -Date,
+  names_to = "Component",
+  values_to = "Value"
+)
+
+stl_long$Component <- factor(
+  stl_long$Component,
+  levels = c("Observed", "Trend", "Seasonal", "Remainder")
+)
+
+ggplot(stl_long, aes(x = Date, y = Value)) +
+  geom_line(
+    color = "#243746",
+    linewidth = 0.3
+  ) +
+  facet_wrap(
+    ~Component,
+    ncol = 1,
+    scales = "free_y"
+  ) +
+  scale_x_date(
+    breaks = as.Date(
+      paste0(seq(1880, 2020, 20), "-01-01")
+    ),
+    date_labels = "%Y"
+  ) +
+  scale_y_continuous(
+    breaks = scales::breaks_pretty(n = 3)
+  ) +
+  labs(
+    x = "Year",
+    y = "Anomaly component (°C)"
+  ) +
+  climate_theme +
+  theme(
+    strip.background = element_rect(
+      fill = "#F2F2F2",
+      color = NA
+    ),
+    strip.text = element_text(
+      size = 8,
+      hjust = 0
+    ),
+    panel.spacing = grid::unit(0.6, "lines")
+  )
+```
+
+The STL trend shows an increase from the early twentieth
+century to the 1940s, followed by a period of relatively
+stable levels and a sustained rise from around the 1970s.
+This movement is much larger than the estimated seasonal
+component, whose deviations remain within a few hundredths
+of a degree. The repetition of that seasonal pattern follows
+from the periodic specification and should not be interpreted
+as independent evidence that seasonality is constant.
+
+The remainder fluctuates around zero without the sustained
+upward movement visible in the observed series, although
+several large deviations remain. STL provides a descriptive
+separation of these components; the following models examine
+how the changing level can be represented through latent
+states and how ten-year changes vary across the record.
+
+With a trend smoothing window of
+`r unname(gistemp_stl$win["t"])` months, the STL trend
+component retains interannual movements and should not
+be interpreted as a trend restricted to climatic time scales.
+
+# Hidden Markov Models
+
+We model the seasonally adjusted anomalies as observations
+from a Gaussian Hidden Markov Model, in which an unobserved
+state \(S_t \in \{1,\ldots,K\}\) determines the mean and
+variance of the temperature distribution:
+
+\[
+y_t \mid S_t=j \sim \mathcal{N}(\mu_j,\sigma_j^2),
+\qquad
+\Pr(S_t=j\mid S_{t-1}=i)=p_{ij}.
+\]
+
+The state sequence follows a first-order Markov chain with
+constant transition probabilities, and observations are
+assumed independent conditional on that sequence. This
+specification can summarize persistent differences in
+temperature levels without fixing the dates of transitions
+in advance, although gradual changes may be represented
+through switches between states.
+
+We estimate models with two through five states by maximum
+likelihood using the EM algorithm. Each specification is
+fitted from 25 random initializations, retaining the converged
+solution with the highest likelihood. BIC is the primary
+selection criterion, while AIC is reported for comparison;
+multiple starts reduce sensitivity to initialization without
+guaranteeing a global maximum.
+
+All 25 initializations converged for each specification.
+For the selected five-state model, 23 reached a log-likelihood
+within \(10^{-4}\) of the best retained value, whereas
+the best four-state solution was reached only once,
+indicating greater sensitivity to initialization for
+that specification.
+
+```{r fit-climate-hmm, cache=TRUE, results='hide'}
+candidate_states <- 2:5
+hmm_seeds <- 123:147
+
+fit_hmm_starts <- function(k, data, seeds) {
+  best_model <- NULL
+  best_loglik <- -Inf
+
+  attempts <- data.frame(
+    Seed = seeds,
+    LogLik = NA_real_,
+    Converged = FALSE,
+    Status = NA_character_
+  )
+
+  for (i in seq_along(seeds)) {
+    set.seed(seeds[i])
+
+    current_fit <- tryCatch(
+      {
+        model <- depmix(
+          Temperature ~ 1,
+          data = data,
+          nstates = k,
+          family = gaussian()
+        )
+
+        fit(
+          model,
+          verbose = FALSE,
+          emcontrol = em.control(
+            maxit = 2000,
+            tol = 1e-8,
+            random.start = TRUE
+          )
+        )
+      },
+      error = function(e) e
+    )
+
+    if (inherits(current_fit, "error")) {
+      attempts$Status[i] <- conditionMessage(current_fit)
+      next
+    }
+
+    current_loglik <- as.numeric(logLik(current_fit))
+    current_status <- paste(
+      current_fit@message,
+      collapse = " "
+    )
+
+    converged <- is.finite(current_loglik) &&
+      grepl(
+        "^Log likelihood converged",
+        trimws(current_status),
+        ignore.case = TRUE
+      )
+
+    attempts$LogLik[i] <- current_loglik
+    attempts$Converged[i] <- converged
+    attempts$Status[i] <- current_status
+
+    if (converged && current_loglik > best_loglik) {
+      best_model <- current_fit
+      best_loglik <- current_loglik
+    }
+  }
+
+  if (is.null(best_model)) {
+    stop("No converged HMM obtained for K = ", k)
+  }
+
+  list(
+    model = best_model,
+    attempts = attempts
+  )
+}
+
+hmm_runs <- lapply(
+  candidate_states,
+  function(k) {
+    fit_hmm_starts(k, climate_data, hmm_seeds)
+  }
+)
+
+names(hmm_runs) <- as.character(candidate_states)
+
+hmm_models <- lapply(hmm_runs, function(x) x$model)
+
+hmm_comparison <- data.frame(
+  States = candidate_states,
+  LogLik = vapply(
+    hmm_models,
+    function(model) as.numeric(logLik(model)),
+    numeric(1)
+  ),
+  AIC = vapply(hmm_models, AIC, numeric(1)),
+  BIC = vapply(hmm_models, BIC, numeric(1))
+)
+
+rownames(hmm_comparison) <- NULL
+
+stopifnot(
+  all(is.finite(as.matrix(hmm_comparison)))
+)
+
+best_hmm_k <- hmm_comparison$States[
+  which.min(hmm_comparison$BIC)
+]
+
+best_hmm_fit <- hmm_models[[as.character(best_hmm_k)]]
+```
+
+```{r hmm-selection-table, results='asis'}
+kable(
+  hmm_comparison,
+  format = "latex",
+  booktabs = TRUE,
+  position = "H",
+  digits = 2,
+  row.names = FALSE,
+  col.names = c("States", "Log-likelihood", "AIC", "BIC"),
+  caption = "Gaussian HMM comparison, retaining the highest-likelihood converged solution from 25 initializations per specification."
+)
+```
+
+Both AIC and BIC decrease throughout the candidate range,
+with their lowest values attained by the five-state model.
+Following the BIC selection rule, we retain this specification
+for parameter interpretation and decoding. Since the minimum
+occurs at the upper limit of the explored range, the comparison
+does not establish that five states would remain preferable
+if more states were considered.
+
+The improvement in fit indicates that additional states help
+represent the changing distribution of temperature anomalies,
+but it does not establish the existence of five distinct
+physical climate regimes. In a series with a sustained trend,
+a level-based HMM may use successive states to approximate
+gradual movement.
+
+For interpretation, states are ordered by increasing estimated
+mean anomaly. The response parameters describe the Gaussian
+distribution associated with each state, while the transition
+matrix reports the probabilities estimated by the HMM.
+These probabilities differ from transition frequencies
+calculated by counting switches in a decoded sequence.
+
+```{r extract-hmm-parameters}
+response_parameters <- lapply(
+  seq_len(best_hmm_k),
+  function(j) {
+    getpars(
+      getmodel(
+        best_hmm_fit,
+        which = "response",
+        state = j,
+        number = 1
+      )
+    )
+  }
+)
+
+stopifnot(
+  all(lengths(response_parameters) == 2)
+)
+
+hmm_means_raw <- vapply(
+  response_parameters,
+  function(x) x[1],
+  numeric(1)
+)
+
+hmm_sds_raw <- vapply(
+  response_parameters,
+  function(x) x[2],
+  numeric(1)
+)
+
+transition_rows <- lapply(
+  seq_len(best_hmm_k),
+  function(j) {
+    getpars(
+      getmodel(
+        best_hmm_fit,
+        which = "transition",
+        state = j
+      )
+    )
+  }
+)
+
+stopifnot(
+  all(lengths(transition_rows) == best_hmm_k)
+)
+
+transition_raw <- do.call(rbind, transition_rows)
+
+stopifnot(
+  all(is.finite(hmm_means_raw)),
+  all(is.finite(hmm_sds_raw)),
+  all(hmm_sds_raw > 0),
+  all(is.finite(transition_raw)),
+  all(transition_raw >= -1e-8),
+  all(transition_raw <= 1 + 1e-8),
+  all(abs(rowSums(transition_raw) - 1) < 1e-8)
+)
+
+hmm_state_order <- order(hmm_means_raw)
+
+hmm_means <- hmm_means_raw[hmm_state_order]
+hmm_sds <- hmm_sds_raw[hmm_state_order]
+
+hmm_transition <- transition_raw[
+  hmm_state_order,
+  hmm_state_order,
+  drop = FALSE
+]
+
+hmm_labels <- paste("State", seq_len(best_hmm_k))
+
+hmm_parameters <- data.frame(
+  State = hmm_labels,
+  Mean = hmm_means,
+  SD = hmm_sds
+)
+
+transition_display <- data.frame(
+  From = hmm_labels,
+  hmm_transition,
+  check.names = FALSE
+)
+
+names(transition_display) <- c(
+  "From / To",
+  hmm_labels
+)
+```
+
+```{r hmm-response-table, results='asis'}
+kable(
+  hmm_parameters,
+  format = "latex",
+  booktabs = TRUE,
+  position = "H",
+  digits = 3,
+  row.names = FALSE,
+  col.names = c(
+    "State",
+    "Mean anomaly (°C)",
+    "SD (°C)"
+  ),
+  caption = "Estimated Gaussian response parameters, with states ordered by increasing mean anomaly."
+)
+```
+
+```{r hmm-transition-table, results='asis'}
+kable(
+  transition_display,
+  format = "latex",
+  booktabs = TRUE,
+  position = "H",
+  digits = 3,
+  row.names = FALSE,
+  caption = "Estimated HMM transition probabilities. Rows identify the current state and columns the following state, using the same ordering as the response-parameter table."
+)
+```
+
+The estimated state means range from -0.449 °C to 1.288 °C,
+with the two lowest states below the reference-period average
+and the remaining three above it. Dispersion also differs
+across states: State 2 has the smallest estimated standard
+deviation, while State 5 has the largest, so the classification
+reflects differences in both level and variability.
+
+Self-transition probabilities are high, ranging from about
+0.900 to a value reported as 1.000 for State 5. For States
+1–4, the fitted probabilities imply expected durations of
+roughly 10–39 months, rather than uniformly long-lasting
+regimes. The near-boundary estimate for State 5 requires
+particular caution: it describes persistence within this
+fitted sample and should not be interpreted as evidence
+that the highest-temperature state is permanently absorbing.
+The decoded sequence will show where these states occur
+and whether they recur across the record.
+
+We recover the most likely joint state sequence using Viterbi
+decoding and plot the observations alongside the estimated
+mean of their assigned state. Decoding uses the full sample,
+so the resulting classification is retrospective rather than
+a reconstruction of what could have been identified in real time.
+
+```{r decode-climate-hmm}
+hmm_states_raw <- posterior(
+  best_hmm_fit,
+  type = "viterbi"
+)$state
+
+state_mapping <- integer(best_hmm_k)
+state_mapping[hmm_state_order] <- seq_len(best_hmm_k)
+
+hmm_states <- state_mapping[hmm_states_raw]
+
+stopifnot(
+  length(hmm_states) == nrow(climate_data),
+  all(hmm_states %in% seq_len(best_hmm_k))
+)
+
+hmm_decoded <- climate_data
+
+hmm_decoded$State <- factor(
+  hmm_states,
+  levels = seq_len(best_hmm_k),
+  labels = hmm_labels
+)
+
+hmm_decoded$StateMean <- hmm_means[hmm_states]
+```
+
+```{r hmm-decoded-plot, fig.width=6.4, fig.height=3, out.width="100%", fig.cap="Viterbi-decoded states of the selected Gaussian HMM. Points show seasonally adjusted anomalies coloured by assigned state; the black step line shows the corresponding estimated state mean. State labels follow increasing mean anomaly."}
+state_colors <- setNames(
+  c(
+    "#24476B",
+    "#508C95",
+    "#63876B",
+    "#B36B35",
+    "#914B59"
+  )[seq_len(best_hmm_k)],
+  hmm_labels
+)
+
+ggplot(hmm_decoded, aes(x = Date)) +
+  geom_hline(
+    yintercept = 0,
+    color = "grey60",
+    linewidth = 0.3,
+    linetype = "dashed"
+  ) +
+  geom_line(
+    aes(y = Temperature),
+    color = "grey80",
+    linewidth = 0.2
+  ) +
+  geom_point(
+    aes(y = Temperature, color = State),
+    size = 0.5,
+    alpha = 0.7
+  ) +
+  geom_step(
+    aes(y = StateMean),
+    color = "#222222",
+    linewidth = 0.5
+  ) +
+  scale_color_manual(
+    values = state_colors,
+    drop = FALSE,
+    name = NULL
+  ) +
+  scale_x_date(
+    breaks = as.Date(
+      paste0(seq(1880, 2020, 20), "-01-01")
+    ),
+    date_labels = "%Y"
+  ) +
+  labs(
+    x = "Year",
+    y = "Anomaly (°C)"
+  ) +
+  climate_theme +
+  theme(
+    legend.position = "top",
+    legend.text = element_text(size = 8),
+    legend.key.width = grid::unit(0.8, "lines")
+  )
+```
+
+The decoded sequence assigns most early observations to the
+three lower-mean states, with repeated switches rather than
+a small number of permanent transitions. More sustained
+assignments to the higher states emerge later in the record:
+State 4 dominates from the late 1990s to the mid-2010s,
+after which State 5 persists through the end of the sample.
+These transitions summarize the shift towards higher
+temperature anomalies, but their dates depend on the fitted
+specification and do not independently establish physical
+climate change points.
+
+The HMM provides a useful classification of temperature
+levels, while its stepwise representation approximates
+movement that need not occur through abrupt changes.
+The final uninterrupted assignment to State 5 extends
+to the sample endpoint, so the duration of that final
+visit is only partially observed. Its near-boundary
+persistence estimate should therefore not be interpreted
+as evidence of permanent absorption. Conditional independence
+given the state sequence remains restrictive, and residual
+serial dependence has not been assessed here.
+
+# Dynamic Linear Models and Decadal Changes
+
+We now represent temperature anomalies through a continuous-valued
+latent level, comparing a random walk plus noise model (RW)
+with a local linear trend model (LLT). In the RW specification,
+the level evolves through random innovations:
+
+\[
+\begin{aligned}
+y_t &= \mu_t + \varepsilon_t,
+& \varepsilon_t &\sim \mathcal{N}(0,\sigma^2),\\
+\mu_t &= \mu_{t-1} + \eta_t,
+& \eta_t &\sim \mathcal{N}(0,\tau^2).
+\end{aligned}
+\]
+
+The LLT specification introduces a slope that can itself
+change over time:
+
+\[
+\begin{aligned}
+y_t &= \mu_t + \varepsilon_t,
+& \varepsilon_t &\sim \mathcal{N}(0,\sigma^2),\\
+\mu_t &= \mu_{t-1} + \beta_{t-1} + \eta_t,
+& \eta_t &\sim \mathcal{N}(0,\tau^2),\\
+\beta_t &= \beta_{t-1} + \zeta_t,
+& \zeta_t &\sim \mathcal{N}(0,\gamma^2).
+\end{aligned}
+\]
+
+Here \(\mu_t\) is the latent anomaly level in degrees Celsius
+and \(\beta_t\) is the slope in degrees Celsius per month.
+Observation errors and state innovations are mutually
+independent, independent over time, and independent of the
+initial state. Both specifications allow stochastic level
+changes, while LLT additionally permits slope changes;
+a slope innovation variance near zero would indicate little
+variation in the slope, without implying that the slope
+itself is zero.
+
+We estimate the variance parameters by maximum likelihood
+on the full adjusted record, using logarithmic parameters
+to ensure positivity and Gaussian initial distributions
+with zero means and covariance \(10^7 I\) as a diffuse
+approximation. Approximate standard errors are obtained
+from the numerical Hessian through the delta method when
+its conditioning permits inversion. The slope-variance
+standard error is omitted if the estimate is numerically
+near the boundary.
+
+```{r fit-climate-dlm, cache=TRUE, cache.extra=as.numeric(gistemp_adj)}
+build_rw <- function(log_variances) {
+  dlmModPoly(
+    order = 1,
+    dV = exp(log_variances[1]),
+    dW = exp(log_variances[2]),
+    m0 = 0,
+    C0 = matrix(1e7, 1, 1)
+  )
+}
+
+build_llt <- function(log_variances) {
+  dlmModPoly(
+    order = 2,
+    dV = exp(log_variances[1]),
+    dW = exp(log_variances[2:3]),
+    m0 = c(0, 0),
+    C0 = diag(1e7, 2)
+  )
+}
+
+sample_variance <- var(as.numeric(gistemp_adj))
+
+fit_rw <- dlmMLE(
+  gistemp_adj,
+  parm = log(c(sample_variance, sample_variance / 10)),
+  build = build_rw,
+  method = "BFGS",
+  hessian = TRUE,
+  control = list(maxit = 2000, reltol = 1e-10)
+)
+
+fit_llt <- dlmMLE(
+  gistemp_adj,
+  parm = log(c(
+    sample_variance,
+    sample_variance / 10,
+    sample_variance / 100
+  )),
+  build = build_llt,
+  method = "BFGS",
+  hessian = TRUE,
+  control = list(maxit = 2000, reltol = 1e-10)
+)
+
+stopifnot(
+  fit_rw$convergence == 0,
+  fit_llt$convergence == 0,
+  all(is.finite(fit_rw$par)),
+  all(is.finite(fit_llt$par))
+)
+
+mod_rw <- build_rw(fit_rw$par)
+mod_llt <- build_llt(fit_llt$par)
+
+variance_standard_errors <- function(fit) {
+  estimates <- exp(fit$par)
+  unavailable <- rep(NA_real_, length(estimates))
+
+  H <- (fit$hessian + t(fit$hessian)) / 2
+
+  if (any(!is.finite(H))) {
+    return(unavailable)
+  }
+
+  eigenvalues <- eigen(H, symmetric = TRUE)$values
+
+  if (min(eigenvalues) <= 1e-8 * max(abs(eigenvalues))) {
+    return(unavailable)
+  }
+
+  estimates * sqrt(diag(solve(H)))
+}
+
+rw_estimates <- exp(fit_rw$par)
+llt_estimates <- exp(fit_llt$par)
+
+dlm_variances <- data.frame(
+  Model = c("RW", "RW", "LLT", "LLT", "LLT"),
+  Parameter = c(
+    "Observation variance",
+    "Level innovation variance",
+    "Observation variance",
+    "Level innovation variance",
+    "Slope innovation variance"
+  ),
+  Estimate = c(rw_estimates, llt_estimates),
+  SE = c(
+    variance_standard_errors(fit_rw),
+    variance_standard_errors(fit_llt)
+  )
+)
+```
+
+```{r climate-dlm-variance-table, results='asis'}
+dlm_variance_display <- dlm_variances
+
+dlm_variance_display$Estimate <- formatC(
+  dlm_variances$Estimate,
+  format = "e",
+  digits = 3
+)
+
+dlm_variance_display$SE <- ifelse(
+  is.na(dlm_variances$SE),
+  "Unavailable",
+  formatC(dlm_variances$SE, format = "e", digits = 3)
+)
+
+slope_near_boundary <-
+  llt_estimates[3] / llt_estimates[1] < 1e-6
+
+if (slope_near_boundary) {
+  dlm_variance_display$Estimate[5] <- "Near zero"
+  dlm_variance_display$SE[5] <- "Not reported"
+}
+
+kable(
+  dlm_variance_display,
+  format = "latex",
+  booktabs = TRUE,
+  position = "H",
+  row.names = FALSE,
+  col.names = c(
+    "Model", "Parameter", "Estimate", "Approx. SE"
+  ),
+  caption = "Full-sample maximum-likelihood variance estimates. Approximate standard errors use the numerical Hessian and delta method. The slope-variance standard error is omitted because the estimate is numerically near zero; the remaining LLT standard errors are local approximations from the full Hessian and require caution near this boundary."
+)
+```
+The two specifications yield similar observation variances,
+approximately `r sprintf("%.4f", rw_estimates[1])` for RW,
+and level innovation variances, approximately
+`r sprintf("%.4f", rw_estimates[2])`. Their ratio in the RW
+model is `r sprintf("%.2f", rw_estimates[2] / rw_estimates[1])`.
+The reconstructed level follows sustained movements while
+reducing some monthly noise, but retains considerable
+interannual variability; it should therefore not be
+interpreted as an isolated long-term climate trend.
+
+The LLT slope innovation variance is numerically near zero,
+making the fitted model approximately a random walk with
+constant drift. The drift can be nonzero, while level
+innovations allow departures from that constant-drift
+evolution. A near-boundary variance estimate does not,
+by itself, establish that the underlying pace of warming
+is constant, since the allocation of variation between
+level and slope depends on the model specification.
+The slope-variance standard error is omitted because
+the usual normal approximation is unreliable near
+the boundary.
+
+Kalman filtering estimates the latent level using observations
+up to each month, while smoothing also incorporates subsequent
+observations. We compare both reconstructions with the adjusted
+series and report pointwise 95 percent intervals for the
+smoothed latent level, conditional on the estimated parameters
+and seasonal adjustment. These are state uncertainty intervals,
+not prediction intervals for observations, so observations
+outside the bands do not by themselves indicate poor coverage.
+Since parameters and seasonal adjustment are estimated from
+the full record, the comparison remains retrospective even
+for the filtered estimates.
+
+```{r climate-filtering-smoothing}
+filter_rw <- dlmFilter(gistemp_adj, mod_rw)
+filter_llt <- dlmFilter(gistemp_adj, mod_llt)
+
+smooth_rw <- dlmSmooth(filter_rw)
+smooth_llt <- dlmSmooth(filter_llt)
+
+extract_climate_levels <- function(filtered, smoothed, model_name) {
+  filtered_mean <- as.matrix(filtered$m)[-1, 1]
+  smoothed_mean <- as.matrix(smoothed$s)[-1, 1]
+
+  filtered_cov <- dlmSvd2var(
+    filtered$U.C,
+    filtered$D.C
+  )
+
+  smoothed_cov <- dlmSvd2var(
+    smoothed$U.S,
+    smoothed$D.S
+  )
+
+  filtered_variance <- vapply(
+    filtered_cov[-1],
+    function(x) as.numeric(x[1, 1]),
+    numeric(1)
+  )
+
+  smoothed_variance <- vapply(
+    smoothed_cov[-1],
+    function(x) as.numeric(x[1, 1]),
+    numeric(1)
+  )
+
+  stopifnot(
+    length(filtered_mean) == nrow(climate_data),
+    length(smoothed_mean) == nrow(climate_data),
+    all(is.finite(filtered_mean)),
+    all(is.finite(smoothed_mean)),
+    all(is.finite(filtered_variance)),
+    all(is.finite(smoothed_variance)),
+    all(filtered_variance >= 0),
+    all(smoothed_variance >= 0),
+    all(smoothed_variance <= filtered_variance + 1e-6),
+    isTRUE(all.equal(
+      tail(filtered_mean, 1),
+      tail(smoothed_mean, 1)
+    ))
+  )
+
+  data.frame(
+    Date = climate_data$Date,
+    Observed = climate_data$Temperature,
+    Filtered = filtered_mean,
+    Smoothed = smoothed_mean,
+    Lower = smoothed_mean -
+      qnorm(0.975) * sqrt(smoothed_variance),
+    Upper = smoothed_mean +
+      qnorm(0.975) * sqrt(smoothed_variance),
+    Model = model_name
+  )
+}
+
+climate_levels_rw <- extract_climate_levels(
+  filter_rw, smooth_rw, "RW"
+)
+
+climate_levels_llt <- extract_climate_levels(
+  filter_llt, smooth_llt, "LLT"
+)
+
+climate_levels <- rbind(
+  climate_levels_rw,
+  climate_levels_llt
+)
+
+climate_levels$Model <- factor(
+  climate_levels$Model,
+  levels = c("RW", "LLT")
+)
+```
+
+```{r climate-dlm-levels-plot, fig.width=6.4, fig.height=2.5, out.width="100%", fig.cap="Filtered and smoothed latent levels under RW and LLT. Shaded bands show pointwise 95 percent conditional smoothing intervals for the latent level, excluding parameter and seasonal-adjustment uncertainty. Both panels use the same axes."}
+ggplot(climate_levels, aes(x = Date)) +
+  geom_ribbon(
+    aes(ymin = Lower, ymax = Upper),
+    fill = "#24476B",
+    alpha = 0.18,
+    show.legend = FALSE
+  ) +
+  geom_line(
+    aes(y = Observed, color = "Observed"),
+    linewidth = 0.2
+  ) +
+  geom_line(
+    aes(y = Filtered, color = "Filtered"),
+    linetype = "dashed",
+    linewidth = 0.35
+  ) +
+  geom_line(
+    aes(y = Smoothed, color = "Smoothed"),
+    linewidth = 0.4
+  ) +
+  facet_wrap(~Model, ncol = 1) +
+  scale_color_manual(
+    values = c(
+      "Observed" = "#BBBBBB",
+      "Filtered" = "#B36B35",
+      "Smoothed" = "#24476B"
+    ),
+    breaks = c("Observed", "Filtered", "Smoothed"),
+    name = NULL
+  ) +
+  guides(
+    color = guide_legend(
+      override.aes = list(
+        linetype = c("solid", "dashed", "solid"),
+        linewidth = c(0.4, 0.5, 0.5)
+      )
+    )
+  ) +
+  scale_x_date(
+    breaks = as.Date(
+      paste0(seq(1880, 2020, 20), "-01-01")
+    ),
+    date_labels = "%Y"
+  ) +
+  labs(
+    x = "Year",
+    y = "Anomaly (°C)"
+  ) +
+  climate_theme +
+  theme(
+    strip.background = element_rect(
+      fill = "#F2F2F2",
+      color = NA
+    ),
+    strip.text = element_text(size = 9),
+    legend.position = "top",
+    legend.text = element_text(size = 8),
+    legend.key.width = grid::unit(1.5, "lines"),
+    panel.spacing = grid::unit(0.8, "lines")
+  )
+```
+RW and LLT produce nearly indistinguishable level
+reconstructions at this plotting scale, both capturing
+the sustained rise in recent decades while attenuating
+monthly fluctuations. The filtered and smoothed estimates
+follow similar trajectories, although smoothing revises
+local movements using subsequent observations. The visual
+similarity between the models is consistent with their
+similar estimated observation and level innovation variances,
+but does not establish equivalence or equal predictive ability.
+
+To describe the pace of warming over successive ten-year
+windows, we calculate the difference between the smoothed
+LLT level and its value 120 months earlier:
+
+\[
+\Delta_{10,t}
+=
+\hat{\mu}_{t\mid T}
+-
+\hat{\mu}_{t-120\mid T}.
+\]
+
+This quantity measures the net change over the preceding
+ten years and can be interpreted as an average warming rate
+over that window, expressed in degrees Celsius per decade.
+It differs from the LLT slope component because changes
+in the latent level also accumulate through level innovations.
+We compare it with the smoothed monthly slope multiplied
+by 120, using the same fitted model throughout.
+
+```{r climate-decadal-changes}
+smoothed_slope <- as.matrix(smooth_llt$s)[-1, 2]
+smoothed_level <- climate_levels_llt$Smoothed
+n_months <- length(smoothed_level)
+
+stopifnot(
+  n_months > 120,
+  length(smoothed_slope) == n_months,
+  all(is.finite(smoothed_slope))
+)
+
+climate_decadal <- data.frame(
+  Date = climate_levels_llt$Date,
+  DecadalChange = c(
+    rep(NA_real_, 120),
+    smoothed_level[121:n_months] -
+      smoothed_level[1:(n_months - 120)]
+  ),
+  SlopePerDecade = 120 * smoothed_slope
+)
+
+climate_decadal_long <- climate_decadal |>
+  filter(is.finite(DecadalChange)) |>
+  pivot_longer(
+    cols = c(DecadalChange, SlopePerDecade),
+    names_to = "Series",
+    values_to = "Rate"
+  ) |>
+  mutate(
+    Series = factor(
+      Series,
+      levels = c("DecadalChange", "SlopePerDecade"),
+      labels = c(
+        "Ten-year level change",
+        "LLT slope (per decade)"
+      )
+    )
+  )
+```
+
+```{r climate-decadal-changes-plot, fig.width=6.4, fig.height=3, out.width="100%", fig.cap="Ten-year backward changes in the smoothed LLT level, compared with the smoothed monthly slope multiplied by 120. Both quantities use the model fitted to the seasonally adjusted series. The ten-year change summarizes movement over an overlapping window; it is not an instantaneous slope estimate or a formal test of acceleration."}
+ggplot(
+  climate_decadal_long,
+  aes(
+    x = Date,
+    y = Rate,
+    color = Series,
+    linetype = Series
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    color = "#888888",
+    linetype = "dashed",
+    linewidth = 0.3
+  ) +
+  geom_line(linewidth = 0.45) +
+  scale_color_manual(
+    values = c(
+      "Ten-year level change" = "#B36B35",
+      "LLT slope (per decade)" = "#24476B"
+    ),
+    name = NULL
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "Ten-year level change" = "solid",
+      "LLT slope (per decade)" = "dashed"
+    ),
+    name = NULL
+  ) +
+  scale_x_date(
+    breaks = as.Date(
+      paste0(seq(1900, 2020, 20), "-01-01")
+    ),
+    date_labels = "%Y"
+  ) +
+  labs(
+    x = "Year",
+    y = "Warming rate (°C per decade)"
+  ) +
+  climate_theme +
+  theme(
+    legend.position = "top",
+    legend.text = element_text(size = 8),
+    legend.key.width = grid::unit(1.5, "lines")
+  )
+```
+
+The ten-year changes alternate between positive and negative
+values from the 1890s through the 1970s. From around 1980,
+positive changes become more prevalent, although substantial
+fluctuations remain and the measure falls sharply at the
+end of the sample. Because each difference compares two
+monthly smoothed levels ten years apart, it remains sensitive
+to interannual variability at both endpoints; a fall in
+this measure does not necessarily imply a decline in
+the temperature level.
+
+The final ten-year change is only
+`r sprintf("%.3f", tail(climate_decadal$DecadalChange, 1))` °C,
+because the smoothed levels in December 2015 and December
+2025 are nearly equal. This illustrates the sensitivity
+of the measure to its endpoints: it does not imply that
+temperatures remained constant throughout the intervening
+decade.
+
+The nearly constant LLT slope provides a sample-wide
+reference, while departures from it in the ten-year changes
+reflect accumulated level innovations. The figure therefore
+describes variation in average temperature changes across
+overlapping windows, without separating long-term changes
+in warming from shorter-term variability. The uncertainty
+of these differences has not been quantified.
+
+Compared with the HMM, the DLMs provide a more natural
+representation of gradual movements through an evolving
+numerical level, whereas the HMM offers an interpretable
+classification into a few temperature states, with repeated
+switches among them during parts of the record. Both
+frameworks use a latent Markov process, conditionally
+independent observations, maximum-likelihood estimation,
+and filtering and smoothing recursions. For a Gaussian DLM, the joint conditional mode coincides
+with the conditional mean, whose components are the marginal
+smoothed means. HMM Viterbi decoding instead selects the
+most likely joint discrete sequence, which can differ from
+the sequence of marginally most probable states obtained
+from forward-backward smoothing. The Viterbi path alone
+does not display classification uncertainty, although
+the HMM can provide smoothed state probabilities; the
+Gaussian smoother provides state means and variances.
+The comparison here concerns representation of the observed
+record, since predictive performance is not compared
+between the frameworks.
+
+# Weather Station Data and Seasonal Adjustment
+
+We now turn from monthly hemispheric anomalies to daily
+maximum temperatures at Houlton AP and Augusta State AP
+in Maine, using the station pair suggested in the assignment.
+The aim is to examine whether allowing dependence between
+their latent temperature levels improves the fit and
+one-step-ahead predictions relative to modelling the stations
+independently.
+
+Although both records extend from June 1948 to December 2024,
+Houlton has a continuous gap of 944 days from May 1, 1985
+to November 30, 1987. We begin the analysis in January 1988,
+the first complete calendar year after this gap, and retain
+observations through December 2024. The resulting common
+period contains 13,515 consecutive daily observations at
+each station, including leap days. This choice excludes
+valid earlier observations in exchange for a continuous,
+aligned sample, without interpolating missing temperatures
+or compressing the time axis. It is based on data availability
+rather than model performance. Maximum temperatures are
+converted from tenths of a degree Celsius to degrees Celsius
+before the analysis.
+
+```{r load-weather-data}
+weather_path <- "data/ghcn_maine.csv"
+
+if (!file.exists(weather_path)) {
+  weather_path <- paste0(
+    "https://raw.githubusercontent.com/",
+    "MnGianmaria/Time-series-analysis/main/",
+    "07_climate_and_weather_models/data/ghcn_maine.csv"
+  )
+}
+
+weather_raw <- read.csv(
+  weather_path,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+stopifnot(
+  all(
+    c(
+      "ID", "station", "latitude", "longitude",
+      "elevation", "date", "TMAX"
+    ) %in% names(weather_raw)
+  )
+)
+
+weather_raw$date <- as.Date(weather_raw$date)
+
+station_ids <- c(
+  "Houlton AP" = "USW00014609",
+  "Augusta State AP" = "USW00014605"
+)
+
+weather_start <- as.Date("1988-01-01")
+weather_end <- as.Date("2024-12-31")
+
+weather_dates <- seq(
+  weather_start,
+  weather_end,
+  by = "day"
+)
+
+weather_data <- weather_raw |>
+  filter(
+    ID %in% unname(station_ids),
+    date >= weather_start,
+    date <= weather_end
+  ) |>
+  transmute(
+    ID,
+    Station = factor(
+      ID,
+      levels = unname(station_ids),
+      labels = names(station_ids)
+    ),
+    Date = date,
+    Latitude = latitude,
+    Longitude = longitude,
+    Elevation = elevation,
+    Temperature = TMAX / 10
+  ) |>
+  arrange(Station, Date)
+
+stopifnot(
+  length(weather_dates) == 13515L,
+  nrow(weather_data) == 2L * length(weather_dates),
+  !anyDuplicated(weather_data[c("ID", "Date")]),
+  all(is.finite(weather_data$Temperature)),
+  all(weather_data$Temperature != -999.9)
+)
+
+for (station_id in unname(station_ids)) {
+  station_dates <- sort(
+    weather_data$Date[weather_data$ID == station_id]
+  )
+
+  missing_dates <- weather_dates[
+    !weather_dates %in% station_dates
+  ]
+
+  extra_dates <- station_dates[
+    !station_dates %in% weather_dates
+  ]
+
+  if (
+    length(station_dates) != length(weather_dates) ||
+    length(missing_dates) > 0L ||
+    length(extra_dates) > 0L
+  ) {
+    stop(
+      "Calendar check failed for ", station_id,
+      "\nObserved days: ", length(station_dates),
+      "\nExpected days: ", length(weather_dates),
+      "\nFirst missing dates: ",
+      paste(head(missing_dates), collapse = ", "),
+      "\nFirst unexpected dates: ",
+      paste(head(extra_dates), collapse = ", ")
+    )
+  }
+
+  stopifnot(
+    identical(
+      as.numeric(station_dates),
+      as.numeric(weather_dates)
+    )
+  )
+}
+weather_station_summary <- weather_data |>
+  group_by(Station) |>
+  summarise(
+    Latitude = first(Latitude),
+    Longitude = first(Longitude),
+    `Elevation (m)` = first(Elevation),
+    Days = n(),
+    Start = as.character(min(Date)),
+    End = as.character(max(Date)),
+    .groups = "drop"
+  )
+```
+```{r weather-station-table, results='asis'}
+knitr::kable(
+  weather_station_summary,
+  format = "latex",
+  booktabs = TRUE,
+  position = "H",
+  row.names = FALSE,
+  digits = c(0, 2, 2, 0, 0, 0, 0),
+  caption = paste(
+    "Selected weather stations and analysis period.",
+    "Daily maximum temperatures are available on every",
+    "calendar day of the selected period at both stations."
+  )
+)
+```
+We remove the annual seasonal pattern separately for each
+station using additive STL with a periodic seasonal window.
+To keep the seasonal cycle aligned with calendar dates,
+STL is fitted to a 365-day calendar excluding February 29.
+The resulting seasonal pattern is then mapped back to the
+complete daily record, assigning February 29 the average
+of the seasonal components for February 28 and March 1.
+Only the seasonal component is interpolated in this step;
+all observed temperatures, including those on leap days,
+are retained for subsequent modelling.
+
+Subtracting this fixed seasonal pattern leaves a series
+containing the temperature level, its longer-term movements,
+and daily fluctuations. Seasonal adjustment uses the full
+1988–2024 sample, so the subsequent one-step predictions
+are evaluated within a retrospective analysis rather than
+as forecasts based exclusively on information available
+at the time.
+```{r weather-seasonal-adjustment}
+adjust_weather_station <- function(station_data) {
+  station_data <- station_data[
+    order(station_data$Date),
+  ]
+
+  month_day <- format(station_data$Date, "%m-%d")
+  non_leap_day <- month_day != "02-29"
+
+  seasonal_fit <- stats::stl(
+    ts(
+      station_data$Temperature[non_leap_day],
+      start = c(1988, 1),
+      frequency = 365
+    ),
+    s.window = "periodic"
+  )
+
+  reference_days <- format(
+    seq(
+      as.Date("2001-01-01"),
+      as.Date("2001-12-31"),
+      by = "day"
+    ),
+    "%m-%d"
+  )
+
+  seasonal_pattern <- tapply(
+    as.numeric(
+      seasonal_fit$time.series[, "seasonal"]
+    ),
+    factor(
+      month_day[non_leap_day],
+      levels = reference_days
+    ),
+    mean
+  )
+
+  seasonal_pattern <- setNames(
+    as.numeric(seasonal_pattern),
+    reference_days
+  )
+
+  seasonal_component <- unname(
+    seasonal_pattern[month_day]
+  )
+
+  seasonal_component[!non_leap_day] <- mean(
+    seasonal_pattern[c("02-28", "03-01")]
+  )
+
+  station_data$Seasonal <- seasonal_component
+  station_data$Adjusted <-
+    station_data$Temperature - seasonal_component
+
+  stopifnot(
+    all(is.finite(station_data$Seasonal)),
+    all(is.finite(station_data$Adjusted))
+  )
+
+  station_data
+}
+
+weather_adjusted <- do.call(
+  rbind,
+  lapply(
+    unname(station_ids),
+    function(station_id) {
+      adjust_weather_station(
+        weather_data[
+          weather_data$ID == station_id,
+        ]
+      )
+    }
+  )
+)
+
+rownames(weather_adjusted) <- NULL
+
+weather_wide <- weather_adjusted |>
+  dplyr::select(Date, Station, Adjusted) |>
+  pivot_wider(
+    names_from = Station,
+    values_from = Adjusted
+  ) |>
+  arrange(Date)
+
+weather_matrix <- as.matrix(
+  weather_wide[, names(station_ids)]
+)
+
+stopifnot(
+  nrow(weather_matrix) == length(weather_dates),
+  ncol(weather_matrix) == 2L,
+  all(is.finite(weather_matrix)),
+  identical(
+    as.numeric(weather_wide$Date),
+    as.numeric(weather_dates)
+  )
+)
+
+weather_adjusted_correlation <- cor(
+  weather_matrix[, 1],
+  weather_matrix[, 2]
+)
+```
+```{r weather-seasonal-adjustment-plot, fig.width=6.4, fig.height=4.2, out.width="100%", fig.cap="Daily maximum temperatures at Houlton AP and Augusta State AP over 2022–2024, before and after seasonal adjustment. The seasonal components are estimated separately using the full 1988–2024 sample. Both panels retain all calendar days and use the same vertical scale."}
+weather_plot_data <- weather_adjusted |>
+  dplyr::filter(Date >= as.Date("2022-01-01")) |>
+  dplyr::select(
+    Date, Station, Temperature, Adjusted
+  ) |>
+  tidyr::pivot_longer(
+    cols = c(Temperature, Adjusted),
+    names_to = "Series",
+    values_to = "Value"
+  ) |>
+  dplyr::mutate(
+    Series = factor(
+      Series,
+      levels = c("Temperature", "Adjusted"),
+      labels = c(
+        "A  Original temperatures",
+        "B  Seasonally adjusted temperatures"
+      )
+    )
+  )
+
+ggplot(
+  weather_plot_data,
+  aes(
+    x = Date,
+    y = Value,
+    color = Station
+  )
+) +
+  geom_line(linewidth = 0.3) +
+  facet_wrap(~Series, ncol = 1) +
+  scale_color_manual(
+    values = c(
+      "Houlton AP" = "#24476B",
+      "Augusta State AP" = "#B36B35"
+    ),
+    breaks = names(station_ids),
+    name = NULL
+  ) +
+  scale_x_date(
+    date_breaks = "1 year",
+    date_labels = "%Y",
+    expand = expansion(mult = c(0.01, 0.01))
+  ) +
+  labs(
+    x = "Year",
+    y = "Temperature (°C)"
+  ) +
+  climate_theme +
+  theme(
+    strip.background = element_rect(
+      fill = "#F2F2F2",
+      color = NA
+    ),
+    strip.text = element_text(
+      size = 9,
+      hjust = 0
+    ),
+    legend.position = "top",
+    legend.text = element_text(size = 8),
+    panel.spacing = grid::unit(0.8, "lines")
+  )
+```
+The original series share a pronounced annual cycle,
+with higher temperatures in summer and lower temperatures
+in winter. After seasonal adjustment, this dominant pattern
+is no longer apparent, while substantial daily fluctuations
+remain and often occur together at the two stations.
+Augusta also tends to retain a higher temperature level
+than Houlton, since removing the seasonal component does
+not remove differences in their average temperatures.
+
+This visual association motivates modelling the two series
+jointly, although it does not establish whether dependence
+improves prediction. We next examine their contemporaneous
+association and temporal persistence over the full
+1988–2024 sample.
+```{r weather-dependence-plot, fig.width=6.4, fig.height=3.2, out.width="100%", fig.cap="Dependence in seasonally adjusted daily maximum temperatures over 1988–2024. Panel A shows contemporaneous observations at the two stations and a fitted linear regression line. Panel B shows sample autocorrelations at lags of 1–30 days, with approximate pointwise 95 percent white-noise reference bounds. These describe the adjusted temperature series, not model forecast errors."}
+weather_scatter_data <- data.frame(
+  Houlton = weather_matrix[, "Houlton AP"],
+  Augusta = weather_matrix[, "Augusta State AP"]
+)
+
+weather_acf_data <- do.call(
+  rbind,
+  lapply(
+    seq_along(station_ids),
+    function(j) {
+      correlations <- as.numeric(
+        stats::acf(
+          weather_matrix[, j],
+          lag.max = 30,
+          plot = FALSE
+        )$acf
+      )[-1]
+
+      data.frame(
+        Lag = seq_along(correlations),
+        ACF = correlations,
+        Station = names(station_ids)[j]
+      )
+    }
+  )
+)
+
+weather_acf_data$Station <- factor(
+  weather_acf_data$Station,
+  levels = names(station_ids)
+)
+
+weather_acf_bound <- qnorm(0.975) /
+  sqrt(nrow(weather_matrix))
+
+p_weather_scatter <- ggplot(
+  weather_scatter_data,
+  aes(x = Houlton, y = Augusta)
+) +
+  geom_point(
+    color = "#24476B",
+    size = 0.35,
+    alpha = 0.12
+  ) +
+  geom_smooth(
+    method = "lm",
+    formula = y ~ x,
+    se = FALSE,
+    color = "#B36B35",
+    linewidth = 0.5
+  ) +
+  labs(
+    title = paste0(
+      "A  Cross-station association (r = ",
+      sprintf("%.3f", weather_adjusted_correlation),
+      ")"
+    ),
+    x = "Houlton AP (°C)",
+    y = "Augusta State AP (°C)"
+  ) +
+  climate_theme
+
+p_weather_acf <- ggplot(
+  weather_acf_data,
+  aes(
+    x = Lag,
+    y = ACF,
+    color = Station,
+    linetype = Station,
+    shape = Station
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    color = "#888888",
+    linewidth = 0.3
+  ) +
+  geom_hline(
+    yintercept = c(
+      -weather_acf_bound,
+      weather_acf_bound
+    ),
+    color = "#888888",
+    linetype = "dashed",
+    linewidth = 0.3
+  ) +
+  geom_line(linewidth = 0.4) +
+  geom_point(size = 0.8) +
+  scale_color_manual(
+    values = c(
+      "Houlton AP" = "#24476B",
+      "Augusta State AP" = "#B36B35"
+    ),
+    name = NULL
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "Houlton AP" = "solid",
+      "Augusta State AP" = "dashed"
+    ),
+    name = NULL
+  ) +
+  scale_shape_manual(
+    values = c(
+      "Houlton AP" = 16,
+      "Augusta State AP" = 17
+    ),
+    name = NULL
+  ) +
+  scale_x_continuous(
+    breaks = c(1, 10, 20, 30)
+  ) +
+  labs(
+    title = "B  Temporal autocorrelation",
+    x = "Lag (days)",
+    y = "ACF"
+  ) +
+  climate_theme +
+  theme(
+    legend.position = "bottom",
+    legend.text = element_text(size = 7)
+  )
+
+p_weather_scatter + p_weather_acf +
+  patchwork::plot_layout(widths = c(1, 1))
+```
+After seasonal adjustment, the contemporaneous correlation
+between the two stations is
+`r sprintf("%.3f", weather_adjusted_correlation)`,
+indicating substantial shared variation beyond the annual
+temperature cycle. The scatter nevertheless shows dispersion
+around the fitted line, so the stations retain distinct
+daily movements.
+
+Both series have similar autocorrelation patterns, with
+a lag-one correlation of approximately 0.57 followed by
+a rapid decline over the first few days. Smaller positive
+correlations persist at longer lags, indicating that seasonal
+adjustment leaves temporal dependence as well as cross-station
+association. These features motivate the bivariate models
+considered next, although contemporaneous correlation alone
+does not establish a gain in one-day-ahead predictive accuracy.
+
+# Bivariate Dynamic Linear Models
+
+Let \(Y_t\) contain the seasonally adjusted maximum
+temperatures at Houlton and Augusta, in that order.
+We model their joint evolution through a bivariate
+local-level specification:
+
+\[
+Y_t = \theta_t + v_t,
+\qquad v_t \sim \mathcal{N}_2(0,V),
+\]
+
+\[
+\theta_t = \theta_{t-1} + w_t,
+\qquad w_t \sim \mathcal{N}_2(0,W).
+\]
+
+The latent vector \(\theta_t\) contains the two temperature
+levels. Observation errors and state innovations are
+independent over time, mutually independent, and independent
+of the initial state. In all three specifications,
+\(V=\operatorname{diag}(\sigma_{v,1}^2,\sigma_{v,2}^2)\),
+so dependence between stations is introduced through
+the evolution covariance \(W\).
+
+Model 1 assumes independent level innovations:
+
+\[
+W_1 =
+\begin{pmatrix}
+\sigma_{w,1}^2 & 0\\
+0 & \sigma_{w,2}^2
+\end{pmatrix}.
+\]
+
+Together with the diagonal observation covariance and
+independent initial states, this specification treats
+the two stations as separate local-level models.
+Model 2 instead estimates an unrestricted positive-definite
+evolution covariance:
+
+\[
+W_2 =
+\begin{pmatrix}
+W_{11} & W_{12}\\
+W_{12} & W_{22}
+\end{pmatrix},
+\]
+
+allowing correlated innovations while retaining different
+innovation variances at the two stations. Model 3 imposes
+a distance-based structure:
+
+\[
+W_3 = \sigma_w^2
+\begin{pmatrix}
+1 & \exp(-\phi d_{12})\\
+\exp(-\phi d_{12}) & 1
+\end{pmatrix},
+\qquad \phi>0.
+\]
+
+Following the assignment, \(d_{12}\) is the Euclidean
+distance between the stations' longitude–latitude coordinates,
+measured in degrees. Model 3 therefore assumes equal
+innovation variances and a positive correlation determined
+by distance. With only two stations and one observed distance,
+this specification allows a structured comparison with
+Model 2, but cannot validate how dependence decays across
+a wider geographical network.
+```{r weather-model-definitions}
+weather_coordinates <- weather_station_summary[
+  match(
+    names(station_ids),
+    as.character(weather_station_summary$Station)
+  ),
+  c("Longitude", "Latitude")
+]
+
+weather_distance <- sqrt(
+  sum(
+    (
+      as.numeric(unlist(weather_coordinates[1, ])) -
+        as.numeric(unlist(weather_coordinates[2, ]))
+    )^2
+  )
+)
+
+stopifnot(
+  is.finite(weather_distance),
+  weather_distance > 0
+)
+
+make_weather_dlm <- function(V, W) {
+  dlm::dlm(
+    m0 = c(0, 0),
+    C0 = diag(1e7, 2),
+    FF = diag(2),
+    V = V,
+    GG = diag(2),
+    W = W
+  )
+}
+
+build_weather_m1 <- function(parameters) {
+  V <- diag(exp(parameters[1:2]))
+  W <- diag(exp(parameters[3:4]))
+
+  make_weather_dlm(V, W)
+}
+
+build_weather_m2 <- function(parameters) {
+  V <- diag(exp(parameters[1:2]))
+
+  L <- matrix(
+    c(
+      exp(parameters[3]),
+      parameters[4],
+      0,
+      exp(parameters[5])
+    ),
+    nrow = 2,
+    ncol = 2
+  )
+
+  W <- tcrossprod(L)
+
+  make_weather_dlm(V, W)
+}
+
+build_weather_m3 <- function(parameters) {
+  V <- diag(exp(parameters[1:2]))
+
+  innovation_variance <- exp(parameters[3])
+  decay <- exp(parameters[4])
+  correlation <- exp(-decay * weather_distance)
+
+  W <- innovation_variance * matrix(
+    c(1, correlation, correlation, 1),
+    nrow = 2,
+    ncol = 2
+  )
+
+  make_weather_dlm(V, W)
+}
+```
+The models contain four, five, and four estimated covariance
+parameters, respectively. We use logarithmic parameters
+for positive quantities and a Cholesky factorization for
+the unrestricted covariance in Model 2. All models share
+a zero-mean Gaussian initial distribution with covariance
+\(10^7 I_2\), used as a diffuse approximation, and are fitted
+by maximizing the Gaussian Kalman-filter likelihood over
+the same adjusted daily observations.
+
+Optimization uses L-BFGS-B with broad numerical bounds
+to prevent invalid or overflowing evaluations. Each
+specification is fitted from three initial parameter vectors,
+retaining the converged solution with the highest likelihood.
+All retained solutions satisfy the optimizer's convergence
+criterion and lie away from the imposed numerical bounds,
+although these checks do not guarantee a global maximum.
+
+For each model, all three initializations converged to
+negative log-likelihood values differing by less than
+\(4\times10^{-5}\), and none of the retained solutions
+was near an imposed numerical bound.
+```{r fit-weather-models, cache=TRUE, cache.extra=list(weather_matrix, weather_distance, body(build_weather_m1), body(build_weather_m2), body(build_weather_m3), body(make_weather_dlm))}
+weather_difference_variance <- apply(
+  diff(weather_matrix),
+  2,
+  var
+)
+
+stopifnot(
+  all(is.finite(weather_difference_variance)),
+  all(weather_difference_variance > 0)
+)
+
+fit_weather_starts <- function(builder, starts) {
+  n_parameters <- length(starts[[1]])
+
+  lower_bounds <- rep(log(1e-8), n_parameters)
+  upper_bounds <- rep(log(1e4), n_parameters)
+
+  if (identical(builder, build_weather_m2)) {
+    lower_bounds <- c(
+      log(1e-8), log(1e-8),
+      log(1e-4), -100, log(1e-4)
+    )
+
+    upper_bounds <- c(
+      log(1e4), log(1e4),
+      log(100), 100, log(100)
+    )
+  }
+
+  objective <- function(parameters) {
+    value <- tryCatch(
+      dlm::dlmLL(
+        y = weather_matrix,
+        mod = builder(parameters)
+      ),
+      error = function(e) Inf
+    )
+
+    if (length(value) != 1L || !is.finite(value)) {
+      return(1e50)
+    }
+
+    as.numeric(value)
+  }
+
+  attempts <- lapply(
+    starts,
+    function(initial_parameters) {
+      tryCatch(
+        stats::optim(
+          par = initial_parameters,
+          fn = objective,
+          method = "L-BFGS-B",
+          lower = lower_bounds,
+          upper = upper_bounds,
+          control = list(
+            maxit = 2000,
+            factr = 1e7
+          )
+        ),
+        error = function(e) {
+          list(
+            convergence = NA_integer_,
+            value = Inf,
+            par = initial_parameters,
+            message = conditionMessage(e)
+          )
+        }
+      )
+    }
+  )
+
+  successful <- vapply(
+    attempts,
+    function(result) {
+      isTRUE(result$convergence == 0L) &&
+        is.finite(result$value) &&
+        result$value < 1e49 &&
+        all(is.finite(result$par))
+    },
+    logical(1)
+  )
+
+  if (!any(successful)) {
+    details <- vapply(
+      attempts,
+      function(result) {
+        paste0(
+          "convergence=", result$convergence,
+          "; message=",
+          paste(result$message, collapse = " ")
+        )
+      },
+      character(1)
+    )
+
+    stop(
+      "No converged fit for this weather model.\n",
+      paste(details, collapse = "\n")
+    )
+  }
+
+  successful_indices <- which(successful)
+
+  best_index <- successful_indices[
+    which.min(
+      vapply(
+        attempts[successful_indices],
+        function(result) result$value,
+        numeric(1)
+      )
+    )
+  ]
+
+  best_fit <- attempts[[best_index]]
+
+  best_fit$lower_bounds <- lower_bounds
+  best_fit$upper_bounds <- upper_bounds
+
+  best_fit$near_numerical_bound <- any(
+    abs(best_fit$par - lower_bounds) < 1e-4 |
+      abs(best_fit$par - upper_bounds) < 1e-4
+  )
+
+  list(
+    fit = best_fit,
+    attempts = attempts
+  )
+}
+
+weather_m1_starts <- lapply(
+  c(0.25, 0.50, 0.75),
+  function(observation_fraction) {
+    log(
+      c(
+        observation_fraction *
+          weather_difference_variance / 2,
+        (1 - observation_fraction) *
+          weather_difference_variance
+      )
+    )
+  }
+)
+
+weather_m1_run <- fit_weather_starts(
+  build_weather_m1,
+  weather_m1_starts
+)
+
+weather_fit_m1 <- weather_m1_run$fit
+weather_mod_m1 <- build_weather_m1(
+  weather_fit_m1$par
+)
+
+weather_initial_v <- diag(weather_mod_m1$V)
+weather_initial_w <- diag(weather_mod_m1$W)
+
+weather_m2_starts <- lapply(
+  c(0.30, 0.70, 0.95),
+  function(initial_correlation) {
+    c(
+      log(weather_initial_v),
+      log(sqrt(weather_initial_w[1])),
+      initial_correlation *
+        sqrt(weather_initial_w[2]),
+      log(
+        sqrt(
+          weather_initial_w[2] *
+            (1 - initial_correlation^2)
+        )
+      )
+    )
+  }
+)
+
+weather_m2_run <- fit_weather_starts(
+  build_weather_m2,
+  weather_m2_starts
+)
+
+weather_fit_m2 <- weather_m2_run$fit
+weather_mod_m2 <- build_weather_m2(
+  weather_fit_m2$par
+)
+
+weather_m3_starts <- lapply(
+  c(0.30, 0.70, 0.95),
+  function(initial_correlation) {
+    initial_decay <- -log(initial_correlation) /
+      weather_distance
+
+    c(
+      log(weather_initial_v),
+      log(mean(weather_initial_w)),
+      log(initial_decay)
+    )
+  }
+)
+
+weather_m3_run <- fit_weather_starts(
+  build_weather_m3,
+  weather_m3_starts
+)
+
+weather_fit_m3 <- weather_m3_run$fit
+weather_mod_m3 <- build_weather_m3(
+  weather_fit_m3$par
+)
+
+weather_fits <- list(
+  M1 = weather_fit_m1,
+  M2 = weather_fit_m2,
+  M3 = weather_fit_m3
+)
+
+weather_models <- list(
+  M1 = weather_mod_m1,
+  M2 = weather_mod_m2,
+  M3 = weather_mod_m3
+)
+
+stopifnot(
+  all(
+    vapply(
+      weather_fits,
+      function(result) {
+        isTRUE(result$convergence == 0L) &&
+          is.finite(result$value) &&
+          result$value < 1e49
+      },
+      logical(1)
+    )
+  )
+)
+
+for (model in weather_models) {
+  stopifnot(
+    all(is.finite(model$V)),
+    all(is.finite(model$W)),
+    min(
+      eigen(
+        model$V,
+        symmetric = TRUE,
+        only.values = TRUE
+      )$values
+    ) > 0,
+    min(
+      eigen(
+        model$W,
+        symmetric = TRUE,
+        only.values = TRUE
+      )$values
+    ) > 0
+  )
+}
+
+weather_optimization_summary <- data.frame(
+  Model = names(weather_fits),
+  Convergence = vapply(
+    weather_fits,
+    function(result) as.integer(result$convergence),
+    integer(1)
+  ),
+  Objective = vapply(
+    weather_fits,
+    function(result) result$value,
+    numeric(1)
+  ),
+  NearNumericalBound = vapply(
+    weather_fits,
+    function(result) result$near_numerical_bound,
+    logical(1)
+  ),
+  row.names = NULL
+)
+```
+Approximate standard errors are calculated from the numerical
+Hessian of the negative log-likelihood and transformed to
+the reported parameter scale using the delta method.
+They are omitted when the Hessian fails the numerical
+conditioning check, when a fitted parameter is near an
+imposed numerical bound, or when the absolute innovation
+correlation is within \(10^{-6}\) of one.
+
+All reported standard errors pass these checks, but remain
+local approximations under the assumed Gaussian model,
+conditional on the estimated seasonal adjustment.
+Passing the numerical checks does not establish reliable
+inference near a covariance boundary or protect against
+misspecification of the temporal dynamics.
+```{r weather-parameter-estimates}
+weather_builders <- list(
+  M1 = build_weather_m1,
+  M2 = build_weather_m2,
+  M3 = build_weather_m3
+)
+
+weather_parameter_values <- function(parameters, model_name) {
+  model <- weather_builders[[model_name]](parameters)
+
+  observation_variances <- diag(model$V)
+  innovation_variances <- diag(model$W)
+
+  innovation_correlation <- model$W[1, 2] /
+    sqrt(prod(innovation_variances))
+
+  if (model_name == "M1") {
+    return(
+      c(observation_variances, innovation_variances)
+    )
+  }
+
+  if (model_name == "M2") {
+    return(
+      c(
+        observation_variances,
+        innovation_variances,
+        model$W[1, 2],
+        innovation_correlation
+      )
+    )
+  }
+
+  c(
+    observation_variances,
+    exp(parameters[3]),
+    exp(parameters[4]),
+    innovation_correlation
+  )
+}
+
+weather_parameter_labels <- list(
+  M1 = c(
+    "Observation variance: Houlton",
+    "Observation variance: Augusta",
+    "Level innovation variance: Houlton",
+    "Level innovation variance: Augusta"
+  ),
+  M2 = c(
+    "Observation variance: Houlton",
+    "Observation variance: Augusta",
+    "Level innovation variance: Houlton",
+    "Level innovation variance: Augusta",
+    "Level innovation covariance",
+    "Level innovation correlation"
+  ),
+  M3 = c(
+    "Observation variance: Houlton",
+    "Observation variance: Augusta",
+    "Common level innovation variance",
+    "Distance decay coefficient",
+    "Level innovation correlation"
+  )
+)
+
+weather_parameter_uncertainty <- function(model_name) {
+  fitted <- weather_fits[[model_name]]
+  parameters <- fitted$par
+  builder <- weather_builders[[model_name]]
+
+  estimates <- weather_parameter_values(
+    parameters,
+    model_name
+  )
+
+  standard_errors <- rep(
+    NA_real_,
+    length(estimates)
+  )
+
+  reason <- "Available"
+
+  model <- builder(parameters)
+
+  correlation <- model$W[1, 2] /
+    sqrt(prod(diag(model$W)))
+
+  if (isTRUE(fitted$near_numerical_bound)) {
+    reason <- "Near numerical bound"
+  } else if (1 - abs(correlation) < 1e-6) {
+    reason <- "Near-boundary innovation correlation"
+  } else {
+    hessian <- tryCatch(
+      stats::optimHess(
+        par = parameters,
+        fn = function(p) {
+          dlm::dlmLL(
+            y = weather_matrix,
+            mod = builder(p)
+          )
+        }
+      ),
+      error = function(e) NULL
+    )
+
+    if (
+      is.null(hessian) ||
+      !all(is.finite(hessian))
+    ) {
+      reason <- "Hessian unavailable"
+    } else {
+      hessian <- (hessian + t(hessian)) / 2
+
+      eigenvalues <- eigen(
+        hessian,
+        symmetric = TRUE,
+        only.values = TRUE
+      )$values
+
+      if (
+        min(eigenvalues) <=
+          1e-8 * max(abs(eigenvalues))
+      ) {
+        reason <- "Hessian not sufficiently conditioned"
+      } else {
+        uncertainty <- tryCatch(
+          {
+            parameter_covariance <- solve(hessian)
+
+            jacobian <- matrix(
+              NA_real_,
+              nrow = length(estimates),
+              ncol = length(parameters)
+            )
+
+            for (j in seq_along(parameters)) {
+              step <- 1e-5 * max(
+                1,
+                abs(parameters[j])
+              )
+
+              upper <- lower <- parameters
+              upper[j] <- upper[j] + step
+              lower[j] <- lower[j] - step
+
+              jacobian[, j] <- (
+                weather_parameter_values(
+                  upper,
+                  model_name
+                ) -
+                  weather_parameter_values(
+                    lower,
+                    model_name
+                  )
+              ) / (2 * step)
+            }
+
+            reported_covariance <- jacobian %*%
+              parameter_covariance %*%
+              t(jacobian)
+
+            reported_variances <- diag(
+              reported_covariance
+            )
+
+            if (
+              !all(is.finite(reported_variances)) ||
+              any(reported_variances < 0)
+            ) {
+              stop("Invalid delta-method variances")
+            }
+
+            sqrt(reported_variances)
+          },
+          error = function(e) NULL
+        )
+
+        if (is.null(uncertainty)) {
+          reason <- "Covariance calculation unavailable"
+        } else {
+          standard_errors <- uncertainty
+        }
+      }
+    }
+  }
+
+  list(
+    table = data.frame(
+      Model = model_name,
+      Parameter = weather_parameter_labels[[model_name]],
+      Estimate = as.numeric(estimates),
+      SE = standard_errors
+    ),
+    reason = reason
+  )
+}
+
+weather_uncertainty <- lapply(
+  names(weather_fits),
+  weather_parameter_uncertainty
+)
+
+names(weather_uncertainty) <- names(weather_fits)
+
+weather_parameter_table <- do.call(
+  rbind,
+  lapply(
+    weather_uncertainty,
+    function(result) result$table
+  )
+)
+
+rownames(weather_parameter_table) <- NULL
+
+weather_se_status <- data.frame(
+  Model = names(weather_uncertainty),
+  Status = vapply(
+    weather_uncertainty,
+    function(result) result$reason,
+    character(1)
+  ),
+  row.names = NULL
+)
+
+format_weather_parameter <- function(value) {
+  if (!is.finite(value)) {
+    return("Not reported")
+  }
+
+  if (value != 0 && abs(value) < 0.001) {
+    return(formatC(value, format = "e", digits = 3))
+  }
+
+  formatC(value, format = "f", digits = 4)
+}
+
+weather_parameter_display <- weather_parameter_table
+
+weather_parameter_display$Estimate <- vapply(
+  weather_parameter_table$Estimate,
+  format_weather_parameter,
+  character(1)
+)
+
+weather_parameter_display$SE <- vapply(
+  weather_parameter_table$SE,
+  format_weather_parameter,
+  character(1)
+)
+correlation_rows <- weather_parameter_table$Parameter ==
+  "Level innovation correlation"
+
+weather_parameter_display$Estimate[correlation_rows] <-
+  formatC(
+    weather_parameter_table$Estimate[correlation_rows],
+    format = "f",
+    digits = 6
+  )
+```
+
+```{r weather-parameter-table, results='asis'}
+knitr::kable(
+  weather_parameter_display,
+  format = "latex",
+  booktabs = TRUE,
+  position = "H",
+  row.names = FALSE,
+  col.names = c(
+    "Model", "Parameter", "Estimate", "Approx. SE"
+  ),
+  caption = paste(
+    "Maximum-likelihood covariance parameter estimates.",
+    "Variances and covariances are in squared degrees Celsius;",
+    "the distance decay coefficient is in inverse degrees",
+    "of coordinate distance, and correlations are dimensionless.",
+    "Standard errors are omitted when numerical",
+    "or boundary checks prevent a reliable approximation."
+  )
+)
+```
+Allowing dependence changes how the model allocates variation
+between observation errors and latent-level innovations.
+Compared with Model 1, Models 2 and 3 estimate smaller
+observation variances and larger level innovation variances,
+with innovation correlations very close to one. Within
+these specifications, much of the shared daily movement
+is represented through strongly correlated changes in
+the latent levels, while the observation errors account
+for a larger share of the variation not shared between
+stations. This allocation is a feature of the fitted models,
+rather than a direct identification of physical weather
+variation and measurement error.
+
+The unrestricted model permits different innovation variances
+at the two stations, whereas the spatial model constrains
+them to be equal. Its small estimated decay coefficient
+corresponds to a correlation close to one at the observed
+station separation, but one station pair cannot establish
+whether the same distance relationship holds elsewhere.
+The reported standard errors are local Hessian-based
+approximations; their numerical availability does not remove
+the need for caution near the correlation boundary.
+
+These estimates describe the fitted covariance structure.
+To assess whether the additional dependence improves the
+model, we next compare likelihood-based criteria and
+one-step-ahead prediction errors.
+
+We compare the three covariance specifications using
+the maximized log-likelihood, AIC, and BIC, calculated
+on the same adjusted observations and conditional on
+the common initial-state distribution. The parameter
+counts include only the estimated covariance parameters,
+with seasonal adjustment treated as fixed. For BIC,
+the sample size is the number of daily bivariate
+observations, rather than the number of individual
+temperature measurements.
+
+```{r weather-model-comparison}
+weather_n_days <- nrow(weather_matrix)
+weather_n_series <- ncol(weather_matrix)
+
+weather_parameter_counts <- vapply(
+  weather_fits,
+  function(result) length(result$par),
+  integer(1)
+)
+
+stopifnot(
+  identical(
+    unname(weather_parameter_counts),
+    c(4L, 5L, 4L)
+  )
+)
+
+weather_gaussian_constant <-
+  weather_n_days * weather_n_series / 2 *
+  log(2 * pi)
+
+weather_loglik <- -vapply(
+  weather_fits,
+  function(result) result$value,
+  numeric(1)
+) - weather_gaussian_constant
+
+weather_comparison <- data.frame(
+  Model = c(
+    "M1: independent",
+    "M2: unrestricted",
+    "M3: spatial"
+  ),
+  Parameters = unname(weather_parameter_counts),
+  LogLik = unname(weather_loglik),
+  AIC = unname(
+    -2 * weather_loglik +
+      2 * weather_parameter_counts
+  ),
+  BIC = unname(
+    -2 * weather_loglik +
+      log(weather_n_days) *
+      weather_parameter_counts
+  )
+)
+
+weather_comparison$DeltaAIC <-
+  weather_comparison$AIC -
+  min(weather_comparison$AIC)
+
+weather_comparison$DeltaBIC <-
+  weather_comparison$BIC -
+  min(weather_comparison$BIC)
+
+stopifnot(
+  all(
+    is.finite(
+      as.matrix(weather_comparison[, -1])
+    )
+  )
+)
+```
+
+```{r weather-model-comparison-table, results='asis'}
+knitr::kable(
+  weather_comparison,
+  format = "latex",
+  booktabs = TRUE,
+  position = "H",
+  row.names = FALSE,
+  digits = c(0, 0, 2, 2, 2, 2, 2),
+  col.names = c(
+    "Model",
+    "Parameters",
+    "Log-likelihood",
+    "AIC",
+    "BIC",
+    "$\\Delta$AIC",
+    "$\\Delta$BIC"
+  ),
+  escape = FALSE,
+  caption = paste(
+    "Likelihood-based comparison of the bivariate DLMs.",
+    "The Gaussian normalization constant is included.",
+    "BIC uses 13,515 daily bivariate observations;",
+    "delta values are differences from the minimum",
+    "of each criterion."
+  )
+)
+```
+Both dependent specifications improve the joint likelihood
+substantially relative to the independent model, and this
+improvement outweighs the parameter penalties in AIC and BIC.
+Among the three candidates, the unrestricted Model 2 achieves
+the lowest values of both criteria. Relative to Model 2,
+the spatial specification has an AIC difference of
+`r sprintf("%.2f", weather_comparison$DeltaAIC[3])`
+and a BIC difference of
+`r sprintf("%.2f", weather_comparison$DeltaBIC[3])`,
+so its smaller parameter count does not compensate for
+the loss in likelihood.
+
+At a single fixed station separation, the spatial model
+can represent any positive innovation correlation through
+its decay coefficient, but also requires equal innovation
+variances at the two stations. Its comparison with Model 2
+therefore does not isolate the value of geographical
+information. The criteria favour the more flexible covariance
+structure within this candidate set, while the implications
+for point prediction require a separate comparison of
+one-step-ahead errors.
+
+# One-Step-Ahead Prediction Comparison
+
+For each fitted model, we calculate the predicted temperature
+vector before incorporating the observations for that day:
+
+\[
+\hat{Y}_{t\mid t-1}
+=
+\mathbb{E}\!\left[
+Y_t \mid Y_1,\ldots,Y_{t-1};\hat{\psi}
+\right],
+\]
+
+where \(\hat{\psi}\) denotes the covariance parameters estimated
+over the full sample. The filter updates the latent states
+as observations become available, while these parameter
+estimates remain fixed. Because both parameter estimation
+and seasonal adjustment use the complete record, the resulting
+errors provide an in-sample comparison rather than an
+out-of-sample assessment of forecasting performance.
+
+We summarize errors using RMSE and MAE separately for each
+station, together with a pooled RMSE that gives equal weight
+to both stations. The first day is excluded from all error
+summaries because its prediction depends entirely on the
+initial-state distribution. All models are evaluated on
+the same remaining dates.
+```{r weather-one-step-predictions}
+weather_filters <- lapply(
+  weather_models,
+  function(model) {
+    dlm::dlmFilter(
+      y = weather_matrix,
+      mod = model
+    )
+  }
+)
+
+weather_predictions <- lapply(
+  weather_filters,
+  function(filtered) {
+    predictions <- as.matrix(filtered$f)
+
+    stopifnot(
+      identical(
+        dim(predictions),
+        dim(weather_matrix)
+      ),
+      all(is.finite(predictions))
+    )
+
+    colnames(predictions) <- colnames(weather_matrix)
+
+    predictions
+  }
+)
+
+weather_errors <- lapply(
+  weather_predictions,
+  function(predictions) {
+    weather_matrix - predictions
+  }
+)
+
+weather_evaluation_rows <- seq.int(
+  2L,
+  nrow(weather_matrix)
+)
+
+weather_accuracy <- do.call(
+  rbind,
+  lapply(
+    names(weather_errors),
+    function(model_name) {
+      errors <- weather_errors[[model_name]][
+        weather_evaluation_rows,
+        ,
+        drop = FALSE
+      ]
+
+      data.frame(
+        Model = model_name,
+        RMSE_Houlton = sqrt(
+          mean(errors[, "Houlton AP"]^2)
+        ),
+        RMSE_Augusta = sqrt(
+          mean(errors[, "Augusta State AP"]^2)
+        ),
+        MAE_Houlton = mean(
+          abs(errors[, "Houlton AP"])
+        ),
+        MAE_Augusta = mean(
+          abs(errors[, "Augusta State AP"])
+        ),
+        RMSE_Pooled = sqrt(mean(errors^2))
+      )
+    }
+  )
+)
+
+rownames(weather_accuracy) <- NULL
+
+stopifnot(
+  length(weather_evaluation_rows) == 13514L,
+  all(
+    is.finite(
+      as.matrix(weather_accuracy[, -1])
+    )
+  )
+)
+```
+
+```{r weather-prediction-accuracy-table, results='asis'}
+knitr::kable(
+  weather_accuracy,
+  format = "latex",
+  booktabs = TRUE,
+  position = "H",
+  row.names = FALSE,
+  digits = 3,
+  col.names = c(
+    "Model",
+    "RMSE Hou.",
+    "RMSE Aug.",
+    "MAE Hou.",
+    "MAE Aug.",
+    "Pooled RMSE"
+  ),
+  caption = paste(
+    "In-sample one-step-ahead prediction errors",
+    "for seasonally adjusted daily maximum temperatures",
+    "(degrees Celsius). All models are evaluated",
+    "over January 2, 1988 to December 31, 2024.",
+    "Parameters and seasonal components are estimated",
+    "using the full sample."
+  )
+)
+```
+Despite the substantial improvement in joint likelihood,
+the three models produce very similar one-step-ahead point
+prediction errors. The pooled RMSE falls from
+`r sprintf("%.3f", weather_accuracy$RMSE_Pooled[1])` °C
+under Model 1 to
+`r sprintf("%.3f", weather_accuracy$RMSE_Pooled[2])` °C
+under Model 2, a reduction of approximately
+`r sprintf("%.2f", 100 * (1 - weather_accuracy$RMSE_Pooled[2] / weather_accuracy$RMSE_Pooled[1]))`
+percent, while Model 3 achieves an almost identical pooled
+result. Model 3 has the lowest RMSE at Houlton and Model 2
+at Augusta; however, Model 2 is slightly worse than Model 1
+at Houlton, and Model 3 is slightly worse than Model 1
+at Augusta. Both dependent models reduce MAE at both
+stations relative to Model 1.
+
+The contrast between likelihood and point prediction reflects
+the different aspects of performance being measured.
+The empirical cross-station correlation of prediction errors
+is approximately 0.79 under Model 1 and 0.83 under Models
+2 and 3. Model 1 nevertheless imposes a diagonal predictive
+covariance, whereas the dependent specifications can represent
+correlated errors. The joint Gaussian likelihood evaluates
+both predicted means and predictive covariance, while RMSE
+and MAE summarize point-prediction errors. The large likelihood
+improvement alongside small changes in RMSE is consistent
+with this distinction, although it does not establish
+that the dependent models adequately capture all remaining
+error structure.
+```{r weather-predictions-plot, fig.width=6.4, fig.height=4.2, out.width="100%", fig.cap="Observed seasonally adjusted daily maximum temperatures and in-sample one-step-ahead predictions from Model 2 over July–December 2024. Predictions are calculated before incorporating each day's observations, with covariance parameters and seasonal components estimated over the full 1988–2024 sample. Both panels use the same vertical scale."}
+weather_prediction_plot_data <- do.call(
+  rbind,
+  lapply(
+    seq_along(station_ids),
+    function(j) {
+      data.frame(
+        Date = weather_wide$Date,
+        Station = names(station_ids)[j],
+        Observed = weather_matrix[, j],
+        Predicted = weather_predictions[["M2"]][, j]
+      )
+    }
+  )
+) |>
+  dplyr::filter(
+    Date >= as.Date("2024-07-01")
+  ) |>
+  dplyr::mutate(
+    Station = factor(
+      Station,
+      levels = names(station_ids)
+    )
+  )
+
+ggplot(
+  weather_prediction_plot_data,
+  aes(x = Date)
+) +
+  geom_line(
+    aes(y = Observed, color = "Observed"),
+    linewidth = 0.35
+  ) +
+  geom_line(
+    aes(y = Predicted, color = "One-step prediction"),
+    linewidth = 0.4,
+    linetype = "dashed"
+  ) +
+  facet_wrap(~Station, ncol = 1) +
+  scale_color_manual(
+    values = c(
+      "Observed" = "#555555",
+      "One-step prediction" = "#24476B"
+    ),
+    breaks = c(
+      "Observed", "One-step prediction"
+    ),
+    name = NULL
+  ) +
+  guides(
+    color = guide_legend(
+      override.aes = list(
+        linetype = c("solid", "dashed")
+      )
+    )
+  ) +
+  scale_x_date(
+    breaks = as.Date(
+  paste0("2024-", sprintf("%02d", 7:12), "-01")
+  ),
+    date_labels = "%b",
+    expand = expansion(mult = c(0.01, 0.01))
+  ) +
+  labs(
+    x = "Month (2024)",
+    y = "Adjusted temperature (°C)"
+  ) +
+  climate_theme +
+  theme(
+    strip.background = element_rect(
+      fill = "#F2F2F2",
+      color = NA
+    ),
+    strip.text = element_text(
+      size = 9,
+      hjust = 0
+    ),
+    legend.position = "top",
+    legend.text = element_text(size = 8),
+    legend.key.width = grid::unit(1.5, "lines"),
+    panel.spacing = grid::unit(0.8, "lines")
+  )
+```
+Over the illustrated period, Model 2 follows gradual
+movements in the adjusted temperatures at both stations,
+but sharp changes often precede the corresponding response
+in its predictions. This is particularly visible around
+several peaks and reversals in November and December,
+where substantial errors remain despite the strong
+estimated dependence between level innovations.
+
+Under the local-level specification, the next day's
+predicted level equals the current filtered level.
+Correlated innovations allow observations from both
+stations to inform that estimate, but do not provide
+a mechanism for anticipating abrupt weather changes.
+The figure illustrates this limitation over the selected
+six months, while the accuracy measures in Table 8
+summarize the full evaluation period.
+
+To assess whether the models capture temporal dependence,
+we examine the autocorrelations of their one-step-ahead
+prediction errors over the full evaluation period.
+These diagnostics concern prediction errors rather than
+the adjusted temperature series plotted earlier; systematic
+autocorrelation would indicate dynamics left unexplained
+by the fitted specifications.
+
+```{r weather-error-acf-plot, fig.width=6.4, fig.height=4.6, out.width="100%", fig.cap="Sample autocorrelations of in-sample one-step-ahead prediction errors at lags of 1–30 days. Rows identify models and columns identify stations. All panels use the same evaluation dates and vertical scale; dashed lines show approximate pointwise 95 percent white-noise reference bounds."}
+weather_error_acf <- do.call(
+  rbind,
+  lapply(
+    names(weather_errors),
+    function(model_name) {
+      do.call(
+        rbind,
+        lapply(
+          seq_along(station_ids),
+          function(j) {
+            errors <- weather_errors[[model_name]][
+              weather_evaluation_rows,
+              j
+            ]
+
+            correlations <- as.numeric(
+              stats::acf(
+                errors,
+                lag.max = 30,
+                plot = FALSE
+              )$acf
+            )[-1]
+
+            data.frame(
+              Model = model_name,
+              Station = names(station_ids)[j],
+              Lag = seq_along(correlations),
+              ACF = correlations
+            )
+          }
+        )
+      )
+    }
+  )
+)
+
+weather_error_acf$Model <- factor(
+  weather_error_acf$Model,
+  levels = names(weather_fits)
+)
+
+weather_error_acf$Station <- factor(
+  weather_error_acf$Station,
+  levels = names(station_ids)
+)
+
+weather_error_bound <- qnorm(0.975) /
+  sqrt(length(weather_evaluation_rows))
+
+ggplot(
+  weather_error_acf,
+  aes(x = Lag, y = ACF)
+) +
+  geom_hline(
+    yintercept = 0,
+    color = "#888888",
+    linewidth = 0.3
+  ) +
+  geom_hline(
+    yintercept = c(
+      -weather_error_bound,
+      weather_error_bound
+    ),
+    color = "#B36B35",
+    linetype = "dashed",
+    linewidth = 0.3
+  ) +
+  geom_segment(
+    aes(
+      xend = Lag,
+      y = 0,
+      yend = ACF
+    ),
+    color = "#24476B",
+    linewidth = 0.35
+  ) +
+  facet_grid(Model ~ Station) +
+  scale_x_continuous(
+    breaks = c(1, 10, 20, 30)
+  ) +
+  labs(
+    x = "Lag (days)",
+    y = "Error ACF"
+  ) +
+  climate_theme +
+  theme(
+    strip.background = element_rect(
+      fill = "#F2F2F2",
+      color = NA
+    ),
+    strip.text = element_text(size = 8),
+    panel.spacing = grid::unit(0.7, "lines")
+  )
+```
+
+The prediction errors retain a systematic short-lag
+autocorrelation pattern under all three specifications.
+Model 1 shows positive lag-one autocorrelation at both
+stations, followed by negative correlations over the next
+few days. Under Models 2 and 3, lag-one autocorrelation
+becomes slightly negative, while lag-two autocorrelation
+remains strongly negative, approximately -0.21 to -0.23,
+with further negative values over subsequent short lags.
+
+These departures extend well beyond the pointwise reference
+bounds and indicate that allowing cross-station dependence
+does not adequately capture the remaining temporal dynamics.
+Although most longer-lag correlations are much smaller,
+the errors cannot be regarded as serially uncorrelated.
+The likelihood preference for Model 2 therefore identifies
+the best-fitting covariance specification among these
+candidates, while the diagnostics reveal a temporal
+limitation shared by all three local-level models.
+
+# Discussion and Limitations
+
+The GISTEMP record documents a sustained increase in Northern
+Hemisphere temperature anomalies, particularly during recent
+decades. The HMM summarizes this evolution through a small
+set of temperature states, while the DLMs represent it through
+an evolving numerical level. The former provides an accessible
+classification, although repeated switches can approximate
+gradual movement rather than distinct climatic breaks;
+the latter accommodates such movement without requiring
+transitions between fixed state means. This comparison
+concerns retrospective representations of the observed
+record, since predictive performance was not compared
+between the two frameworks.
+
+RW and LLT yield nearly indistinguishable level reconstructions,
+with the estimated LLT slope innovation variance close to
+zero. Within this fitted specification, the slope is therefore
+approximately constant, although level innovations still
+allow departures from a straight trajectory. Ten-year changes
+in the smoothed level show variation in the pace of warming,
+with predominantly positive changes in recent decades,
+but also substantial fluctuations. These overlapping
+differences provide a descriptive measure of movement
+over ten-year windows rather than a formal test of
+acceleration.
+
+For the weather stations, allowing correlated level
+innovations substantially improves the joint likelihood,
+and both AIC and BIC favour the unrestricted covariance
+model. The corresponding reduction in pooled one-step RMSE
+is small, however, and station-level rankings vary across
+models and error measures. Dependence is consequently
+valuable for representing joint variation in this sample,
+while its benefit for marginal point prediction is limited.
+The spatial specification offers a compact covariance
+structure, but with only one station pair its decay
+coefficient cannot establish a geographical relationship
+that generalizes to other distances.
+
+The weather analysis uses a continuous common period from
+1988 to 2024 to avoid the earlier gap in Houlton's record,
+at the cost of excluding valid observations before that
+period. All three models retain short-lag autocorrelation
+in their prediction errors, indicating that covariance
+flexibility alone does not capture the temporal dynamics.
+Their Gaussian, constant-variance assumptions also remain
+modelling restrictions; the reported comparisons do not
+establish that these assumptions adequately describe
+extreme temperatures or changes in variability.
+
+Finally, seasonal components and model parameters are
+estimated using the full samples. Weather prediction
+errors therefore describe in-sample performance, and
+the climate reconstructions incorporate information
+unavailable at earlier dates. State intervals and parameter
+standard errors condition on the estimated seasonal
+adjustment, while state intervals additionally exclude
+parameter uncertainty. Near-boundary variance and
+correlation estimates warrant caution with local
+Hessian-based approximations. The results support
+descriptive conclusions about the supplied records,
+without establishing physical mechanisms, real-time
+forecasting performance, or accuracy at longer horizons.
