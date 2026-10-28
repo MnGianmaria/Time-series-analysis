@@ -37,3 +37,8 @@ Open `nile_dynamic_linear_model.Rmd` in RStudio and select **Knit to PDF**. PDF 
 The model assumes Gaussian, independent observation and state innovations with constant variances. It describes changes in the latent level without explicitly identifying structural breaks or their causes.
 
 Smoothing uses the full sample and therefore provides a retrospective reconstruction. State intervals condition on the specified variances and exclude parameter uncertainty. Maximum-likelihood estimates and their approximate standard errors depend on the fixed initial distribution.
+
+## Author
+
+Gianmaria Monaco  
+Bocconi University · Time Series Analysis · Academic year 2025–2026 · Group 32
