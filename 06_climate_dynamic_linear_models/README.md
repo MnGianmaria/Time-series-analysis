@@ -35,3 +35,8 @@ Required R packages: `ggplot2`, `zoo`, `dlm`, `knitr`, and `rmarkdown`. A LaTeX 
 ## Limitations
 
 State intervals exclude parameter and seasonal-adjustment uncertainty. Evaluation uses a single chronological split and revised historical data; it does not establish long-horizon or real-time forecasting performance.
+
+## Author
+
+Gianmaria Monaco  
+Bocconi University · Time Series Analysis · Academic year 2025–2026 · Group 32
